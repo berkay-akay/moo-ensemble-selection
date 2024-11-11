@@ -1,6 +1,6 @@
 from assembled_ensembles.wrapper.abstract_ensemble import AbstractEnsemble
 import numpy as np
-from typing import List, Optional, Union
+from typing import List, Optional, Callable, Union
 from assembled_ensembles.wrapper.abstract_weighted_ensemble import AbstractWeightedEnsemble # Abstract class for ensemble selection methods
 from assembled_ensembles.util.metrics import AbstractMetric
 from sklearn.utils import check_random_state
@@ -18,7 +18,7 @@ from art.estimators.classification import SklearnClassifier
 
 # TODO: Add requirements (with specific version) in dockerfile
 
-class MOOEnsembleSelection(AbstractWeightedEnsemble):
+class MOOEnsembleSelection(AbstractWeightedEnsemble): 
     """
     Multi-Objective Ensemble Selection using NSGA-II and Adversarial Robustness Toolbox.
 
@@ -50,7 +50,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         self.population_size = population_size
         self.score_metric = score_metric
         self.random_state = check_random_state(random_state)
-        self.n_jobs = n_jobs
+        self.n_jobs = n_jobs 
 
     def ensemble_fit(self, base_models_predictions: List, labels: np.ndarray) -> AbstractEnsemble:
         # Defines optimization problem by creating an instance of MOOEnsembleProblem. 
