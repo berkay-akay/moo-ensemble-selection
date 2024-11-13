@@ -93,8 +93,42 @@ class MOOEnsembleProblem(Problem):
 
     
     def _evaluate_robustness(self, weights: np.ndarray) -> float:
-        # TODO: Evaluate robustness of ensemble using ART
-        return
+        """
+        Evaluate robustness of ensemble using ART black-box attack
+
+        Parameters
+        ----------
+        weights: np.ndarray
+            Ensemble weight vector.
+
+        Returns
+        -------
+        float
+            Robustness metric (adversarial accuracy).
+        """
+        # Create ensemble model that is compatible with ART (with internal class)
+        ensemble_model = self._EnsembleModel(self.base_models, weights)
+
+        # Wrap model with ART's SklearnClassifier
+        classifier = SklearnClassifier(model=ensemble_model, clip_values=(0, 1))
+
+        # Instantiate adversarial attack (f.e. Boundary Attack by Brendel et al. [2018])
+        # TODO: Not final, maybe use other black-box attacks from ART 
+        attack = BoundaryAttack(estimator=classifier)
+
+        # Generate adversarial examples using the attack
+        # TODO: Pass the required input data (self.X) correctly -> Data needs to be extracted from the metatask
+        #       and passed to the MOOEnsembleSelection instance, after that it needs to be passed to the MOOEnsembleProblem instance so
+        #       that it can be used for adversarial attack generation.
+        x_test_adv = attack.generate(x=self.X) # self.X is not defined yet !!! 
+
+        # Get ensemble predictions on adversarial examples
+        adv_preds = classifier.predict(x_test_adv)
+
+        # Evaluate robustness (adversarial accuracy)
+        adv_accuracy = self.score_metric(self.labels, adv_preds, to_loss=False, checks=False)
+
+        return adv_accuracy
 
     
     class _EnsembleModel:
