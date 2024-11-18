@@ -22,16 +22,20 @@ class MOOEnsembleProblem(Problem):
         Metric for accuracy evaluation.
     base_models: List[Callable]
         List of base model instances.
+    X: np.ndarray
+        Data instances (with input features) from validation set.
     random_state: Optional[Union[int, np.random.RandomState]]
         Random state for reproducibility.
     n_jobs: int
         Number of jobs for parallel processing.
 
-    TODO: Add parameter for final ensemble selection (value between 0 and 1 to prioritize either accuracy or robustness).
+    TODO: Add parameter for deciding which adversarial attack to use for robustness evaluation.
+          Add parameter for final ensemble selection (value between 0 and 1 to prioritize either accuracy or robustness).
+          For the first approach return the full Pareto front.
     """
 
     def __init__(self, n_base_models: int, predictions: List[np.ndarray], labels: np.ndarray,
-                 score_metric: AbstractMetric, base_models: List[Callable],
+                 score_metric: AbstractMetric, base_models: List[Callable], X: np.ndarray,
                  random_state: Optional[Union[int, np.random.RandomState]] = None,
                  n_jobs: int = -1):
         # Initialize the superclass (Pymoo problem)
@@ -48,6 +52,7 @@ class MOOEnsembleProblem(Problem):
         self.labels = labels
         self.score_metric = score_metric
         self.base_models = base_models
+        self.X = X
         self.random_state = check_random_state(random_state)
         self.n_jobs = n_jobs
 
@@ -88,8 +93,25 @@ class MOOEnsembleProblem(Problem):
 
     
     def _ensemble_predict(self, predictions: List[np.ndarray], weights: np.ndarray) -> np.ndarray:
-        # TODO: Compute predictions by aggregating predictions of base models (using weights)
-        return 
+        """
+        Compute ensemble predictions by aggregating predictions of base models (using weights)
+
+        Parameters
+        ----------
+        predictions: List[np.ndarray]
+            Predictions from base models.
+        weights: np.ndarray
+            Weights for combining base models.
+
+        Returns
+        -------
+        np.ndarray
+            Weighted ensemble predictions.
+        """
+        # Compute weighted sum of base model predictions
+        weighted_preds = np.tensordot(weights, predictions, axes=([0], [0]))
+
+        return weighted_preds
 
     
     def _evaluate_robustness(self, weights: np.ndarray) -> float:
@@ -121,7 +143,7 @@ class MOOEnsembleProblem(Problem):
         #       and passed to the MOOEnsembleSelection instance, after that it needs to be passed to the MOOEnsembleProblem instance so
         #       that it can be used for adversarial attack generation.
         x_test_adv = attack.generate(x=self.X) # self.X is not defined yet !!! 
-
+ 
         # Get ensemble predictions on adversarial examples
         adv_preds = classifier.predict(x_test_adv)
 
@@ -149,10 +171,41 @@ class MOOEnsembleProblem(Problem):
 
         
         def predict(self, X):
-            # TODO: Get predicted class labels for data instance X
-            return
+            """
+            Predict class labels for data instance X (using ensemble)
+
+            Parameters
+            ----------
+            X: np.ndarray
+                Input features of data instance.
+
+            Returns
+            -------
+            np.ndarray
+                Predicted class labels.
+            """
+            # Collect predictions from each base model
+            base_preds = [model.predict_proba(X) for model in self.base_models]
+
+            # Compute weighted ensemble prediction
+            ensemble_pred = np.tensordot(self.weights, base_preds, axes=([0], [0]))
+
+            return ensemble_pred
 
         
         def predict_proba(self, X):
-            # TODO: Get ensemble model prediction probabilities for data instance X
-            return
+            """
+            Get ensemble model prediction probabilities for data instance X.
+
+            Parameters
+            ----------
+            X: np.ndarray
+                Input features.
+
+            Returns
+            -------
+            np.ndarray
+                Predicted probabilities.
+            """
+            # Simply call predict method
+            return self.predict(X)
