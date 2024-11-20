@@ -52,12 +52,68 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         self.random_state = check_random_state(random_state)
         self.n_jobs = n_jobs 
 
-    def ensemble_fit(self, base_models_predictions: List, labels: np.ndarray) -> AbstractEnsemble:
-        # Defines optimization problem by creating an instance of MOOEnsembleProblem. 
-        # Fits the ensemble by finding optimal weights using NSGA-II.  
-        # Chooses optimal ensemble/weight vector based on evaluation performance. 
-        # TODO: Include trade-off parameter to balance objectives in selection step of final ensemble
-        return super().ensemble_fit(base_models_predictions, labels)
+    
+    def ensemble_fit(self, base_models_predictions: List[np.ndarray], labels: np.ndarray, X: np.ndarray) -> 'MOOEnsembleSelection':
+        """
+        Defines optimization problem by creating an instance of MOOEnsembleProblem. 
+        Fits the ensemble by finding optimal weights using NSGA-II.  
+        Chooses optimal ensemble/weight vector based on evaluation performance.
+
+        TODO: Include trade-off parameter to balance objectives in selection step of final ensemble
+
+        Parameters
+        ----------
+        base_models_predictions: List[np.ndarray]
+            List of predictions from base models on validation data.
+        labels: np.ndarray
+            True labels of the validation data.
+        X: np.ndarray
+            Input features of the validation data.
+
+        Returns
+        -------
+        self
+        """
+        # Number of base models
+        n_base_models = len(self.base_models)
+
+        # Create instance of MOOEnsembleProblem
+        problem = MOOEnsembleProblem(
+            n_base_models=n_base_models,
+            predictions=base_models_predictions,
+            labels=labels,
+            score_metric=self.score_metric,
+            base_models=self.base_models,
+            X=X,
+            random_state=self.random_state,
+            n_jobs=self.n_jobs
+        )
+
+        # Configure population size of NSGA-II algorithm
+        algorithm = get_algorithm("nsga2", pop_size=self.population_size)
+
+        # Run optimization with Pymoo
+        res = minimize(
+            problem,
+            algorithm,
+            ('n_gen', self.n_generations),
+            seed=self.random_state.randint(1, 100000),
+            verbose=True
+        )
+
+        # Extract Pareto front solutions
+        # For now, select the solution with the lowest negative accuracy (highest accuracy)
+        # Since we minimized negative accuracy, we find the index with the lowest 'F' value in the first column
+        best_index = np.argmin(res.F[:, 0])  # Minimize negative accuracy (column 0 for accuracy, column 1 for robustness)
+        best_weights = res.X[best_index]  # Get corresponding weights
+
+        # Normalize weights
+        self.weights_ = best_weights / np.sum(best_weights)
+
+        # Optionally store validation loss or other metrics
+        self.validation_loss_ = -res.F[best_index, 0]  # Convert back to positive accuracy
+
+        return self
     
     def predict_proba(self, X):
         # Predicts probabilities for new data using the fitted final ensemble.

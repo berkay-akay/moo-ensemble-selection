@@ -139,10 +139,7 @@ class MOOEnsembleProblem(Problem):
         attack = BoundaryAttack(estimator=classifier)
 
         # Generate adversarial examples using the attack
-        # TODO: Pass the required input data (self.X) correctly -> Data needs to be extracted from the metatask
-        #       and passed to the MOOEnsembleSelection instance, after that it needs to be passed to the MOOEnsembleProblem instance so
-        #       that it can be used for adversarial attack generation.
-        x_test_adv = attack.generate(x=self.X) # self.X is not defined yet !!! 
+        x_test_adv = attack.generate(x=self.X)
  
         # Get ensemble predictions on adversarial examples
         adv_preds = classifier.predict(x_test_adv)
