@@ -257,7 +257,7 @@ class AskAssembler:
                 # -- Store Data
                 logger.info("Store Predictor Data")
                 self._store_fold_predictors(fold_idx, ask_run_id, bm_config, val_y_pred, val_indices, test_y_pred,
-                                            fit_time, predict_time, model_evaluated_time)
+                                            fit_time, predict_time, model_evaluated_time, bm_model) # Added bm_model parameter (to be able to save model to disk)
 
             # -- Store fold errors
             logger.info("Found the following Errors with Auto-sklearn: {}".format(ask_errors_[fold_idx]))
