@@ -102,16 +102,16 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         )
 
         # Extract Pareto front solutions
-        # For now, select the solution with the lowest negative accuracy (highest accuracy)
+        # For now, select the solution with the lowest negative accuracy (highest accuracy) -> Think of a good way to return full Pareto front soon
         # Since we minimized negative accuracy, we find the index with the lowest 'F' value in the first column
         best_index = np.argmin(res.F[:, 0])  # Minimize negative accuracy (column 0 for accuracy, column 1 for robustness)
         best_weights = res.X[best_index]  # Get corresponding weights
 
-        # Normalize weights
+        # Store normalized weights
         self.weights_ = best_weights / np.sum(best_weights)
 
-        # Optionally store validation loss or other metrics
-        self.validation_loss_ = -res.F[best_index, 0]  # Convert back to positive accuracy
+        # # Optionally store validation loss or other metrics
+        # self.validation_loss_ = -res.F[best_index, 0]  # Convert back to positive accuracy
 
         return self
     
@@ -120,6 +120,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         # Calls ensemble_predict method
         # Info: Is not used for the ensemble selection process itself
         return super().predict_proba(X)
+
 
     def ensemble_predict(self, predictions: Any | List) -> np.ndarray:
         # Aggregate ensemble prediction based on base model predictions and ensemble weights.
