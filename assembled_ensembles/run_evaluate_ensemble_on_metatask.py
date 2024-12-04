@@ -77,7 +77,7 @@ if __name__ == "__main__":
 
     config = Configuration(cs, name_grid_mapping[ensemble_method_name])
     cs.check_configuration(config)
-    technique_run_args = get_ensemble_switch_case_config(config,
+    technique_run_args = get_ensemble_switch_case_config(config,                                                    # TODO: Include MOOEnsembleSelection
                                                          rng_seed=rng_seed, metric=ens_metric, n_jobs=n_jobs,
                                                          is_binary=is_binary, labels=list(range(mt.n_classes)))
     print("Run for Config:", config)

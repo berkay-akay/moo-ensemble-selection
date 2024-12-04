@@ -8,7 +8,7 @@ def get_qdo_config_space(seed_function_individual_fold):
     )
 
     # -- Basic Space
-    hp_methods = Categorical("method", ["SingleBest", "EnsembleSelection", "QDOEnsembleSelection"])
+    hp_methods = Categorical("method", ["SingleBest", "EnsembleSelection", "QDOEnsembleSelection", "MOOEnsembleSelection"])
 
     # -- EnsembleSelection Parameters
     hp_use_best = Categorical("use_best", [True, False])
@@ -20,6 +20,14 @@ def get_qdo_config_space(seed_function_individual_fold):
 
     hp_archive_type = Categorical("archive_type", ["sliding", "quality"])
     cond_3 = EqualsCondition(hp_archive_type, hp_methods, "QDOEnsembleSelection")
+
+    # Hyperparameters for MOOEnsembleSelection (first idea, not final)
+    hp_n_generations = Categorical("n_generations", [10, 20, 50])
+    cond_n_generations = EqualsCondition(hp_n_generations, hp_methods, "MOOEnsembleSelection")
+
+    hp_population_size = Categorical("population_size", [50, 100, 200])
+    cond_population_size = EqualsCondition(hp_population_size, hp_methods, "MOOEnsembleSelection")
+
 
     # - Diversity Space (only valid for quality diversity search method)
     hp_behavior_space = Categorical("behavior_space", ["bs_configspace_similarity_and_loss_correlation"])
@@ -67,6 +75,8 @@ def get_qdo_config_space(seed_function_individual_fold):
         hp_methods, hp_use_best, hp_archive_type, hp_behavior_space, hp_emitter_init,
         hp_emitter_elite_selection_method, hp_max_elites, hp_emitter_starting_step_size, hp_buffer_ratio,
         hp_batch_size,
+        hp_n_generations, # For NSGA-II in MOOEnsembleSelection
+        hp_population_size, # For NSGA-II in MOOEnsembleSelection
 
         # Crossover
         hp_emitter_crossover, hp_crossover_probability, hp_crossover_probability_dynamic,
@@ -74,7 +84,7 @@ def get_qdo_config_space(seed_function_individual_fold):
 
     ])
     cs.add_conditions([
-        cond_1, cond_3, cond_4, cond_5, cond_6, cond_7, cond_8, cond_batch_size,
+        cond_1, cond_3, cond_4, cond_5, cond_6, cond_7, cond_8, cond_batch_size, cond_n_generations, cond_population_size,
 
         # Crossover
         cond_9, cond_10, cond_11, cond_12, cond_13, cond_17
