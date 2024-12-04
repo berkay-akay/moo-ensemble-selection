@@ -4,6 +4,7 @@ from typing import List, Optional, Callable, Union
 from assembled_ensembles.wrapper.abstract_weighted_ensemble import AbstractWeightedEnsemble # Abstract class for ensemble selection methods
 from assembled_ensembles.util.metrics import AbstractMetric
 from sklearn.utils import check_random_state
+import pickle
 
 # Pymoo Imports (for running NSGA-II)
 from pymoo.factory import get_algorithm
@@ -25,7 +26,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
     Parameters
     ----------
     base_models: List[Callable]
-        The pool of fitted "fake" base models, that only encapsulate the base model predictions.
+        "Fake" base models, that only encapsulate the base model predictions.
     n_generations: int
         Number of generations for NSGA-II algorithm.
     population_size: int
@@ -53,8 +54,9 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         self.n_jobs = n_jobs
 
     
-    def ensemble_fit(self, base_models_predictions: List[np.ndarray], labels: np.ndarray, X: np.ndarray) -> 'MOOEnsembleSelection': # Rename to "fit", because in evaluate_ensemble_on_metatask the method that is called for the EnsembleSelectionMethodObject is "fit"
+    def fit(self, base_models_predictions: List[np.ndarray], labels: np.ndarray, X: np.ndarray) -> 'MOOEnsembleSelection': # Rename to "fit", because in evaluate_ensemble_on_metatask the method that is called for the EnsembleSelectionMethodObject is "fit"
         """
+        Loads actual base models. 
         Defines optimization problem by creating an instance of MOOEnsembleProblem. 
         Fits the ensemble by finding optimal weights using NSGA-II.  
         Chooses optimal ensemble/weight vector based on evaluation performance.
@@ -77,13 +79,23 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         # Number of base models
         n_base_models = len(self.base_models)
 
+        # Load actual base models using paths from predictor descriptions
+        actual_base_models = []
+        for predictor in self.base_models:
+            base_model_path = predictor.description.get("base_model_path")
+            if base_model_path is None:
+                raise ValueError("Base model path not found in predictor description.")
+            with open(base_model_path, "rb") as f:
+                base_model = pickle.load(f)
+                actual_base_models.append(base_model)
+
         # Create instance of MOOEnsembleProblem
         problem = MOOEnsembleProblem(
             n_base_models=n_base_models,
             predictions=base_models_predictions,
             labels=labels,
             score_metric=self.score_metric,
-            base_models=self.base_models,
+            base_models=actual_base_models,  # Use loaded base models
             X=X,
             random_state=self.random_state,
             n_jobs=self.n_jobs
@@ -119,12 +131,49 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         return self
     
     def predict_proba(self, X):
-        # Predicts probabilities for new data using the fitted final ensemble.
-        # Calls ensemble_predict method
-        # Info: Is not used for the ensemble selection process itself
-        return super().predict_proba(X)
+        """
+        Predicts probabilities for new data using the fitted final ensemble.
 
+        Parameters
+        ----------
+        X: np.ndarray
+            Input features of the data.
 
-    def ensemble_predict(self, predictions: Any | List) -> np.ndarray:
-        # Aggregate ensemble prediction based on base model predictions and ensemble weights.
-        return super().ensemble_predict(predictions)
+        Returns
+        -------
+        np.ndarray
+            Predicted probabilities.
+        """
+        # Ensure that ensemble model has been fitted
+        if not hasattr(self, 'weights_'):
+            raise Exception("The ensemble has not been fitted yet.")
+
+        # Collect predictions from "fake" base models
+        base_models_predictions = [predictor.predict_proba(X) for predictor in self.base_models]
+
+        # Aggregate ensemble predictions using weights
+        ensemble_pred = self.ensemble_predict(base_models_predictions)
+
+        return ensemble_pred
+
+    def ensemble_predict(self, predictions: List[np.ndarray]) -> np.ndarray:
+        """
+        Aggregate ensemble prediction based on base model predictions and ensemble weights.
+
+        Parameters
+        ----------
+        predictions: List[np.ndarray]
+            List of predictions from "fake" base models.
+
+        Returns
+        -------
+        np.ndarray
+            Aggregated ensemble predictions.
+        """
+        # Normalize weights
+        weights = self.weights_ / np.sum(self.weights_)
+
+        # Compute weighted sum of base model predictions
+        weighted_preds = np.tensordot(weights, predictions, axes=([0], [0]))
+
+        return weighted_preds

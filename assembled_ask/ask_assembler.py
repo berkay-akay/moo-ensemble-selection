@@ -555,7 +555,8 @@ class AskAssembler:
             "config": config,
             "fit_time": predictor_data["fit_time"],
             "predict_time": predictor_data["predict_time"],
-            "model_evaluated_time": predictor_data["model_evaluated_time"]
+            "model_evaluated_time": predictor_data["model_evaluated_time"],
+            "base_model_path": predictor_data["base_model_path"] # Include path to base models
         }
 
         # Get Predictions
