@@ -110,8 +110,8 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         # Store normalized weights
         self.weights_ = best_weights / np.sum(best_weights)
 
-        # # Optionally store validation loss or other metrics
-        # self.validation_loss_ = -res.F[best_index, 0]  # Convert back to positive accuracy
+        # Store validation loss or other metrics
+        self.validation_loss_ = -res.F[best_index, 0]  # Convert back to positive accuracy
 
         return self
     
