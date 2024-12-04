@@ -25,7 +25,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
     Parameters
     ----------
     base_models: List[Callable]
-        The pool of fitted base models.
+        The pool of fitted "fake" base models, that only encapsulate the base model predictions.
     n_generations: int
         Number of generations for NSGA-II algorithm.
     population_size: int
@@ -50,10 +50,10 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         self.population_size = population_size
         self.score_metric = score_metric
         self.random_state = check_random_state(random_state)
-        self.n_jobs = n_jobs 
+        self.n_jobs = n_jobs
 
     
-    def ensemble_fit(self, base_models_predictions: List[np.ndarray], labels: np.ndarray, X: np.ndarray) -> 'MOOEnsembleSelection':
+    def ensemble_fit(self, base_models_predictions: List[np.ndarray], labels: np.ndarray, X: np.ndarray) -> 'MOOEnsembleSelection': # Rename to "fit", because in evaluate_ensemble_on_metatask the method that is called for the EnsembleSelectionMethodObject is "fit"
         """
         Defines optimization problem by creating an instance of MOOEnsembleProblem. 
         Fits the ensemble by finding optimal weights using NSGA-II.  
@@ -102,7 +102,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         )
 
         # Extract Pareto front solutions
-        # For now, select the solution with the lowest negative accuracy (highest accuracy) -> Think of a good way to return full Pareto front soon
+        # For now, select the solution with the lowest negative accuracy (highest accuracy)
         # Since we minimized negative accuracy, we find the index with the lowest 'F' value in the first column
         best_index = np.argmin(res.F[:, 0])  # Minimize negative accuracy (column 0 for accuracy, column 1 for robustness)
         best_weights = res.X[best_index]  # Get corresponding weights
@@ -110,8 +110,11 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         # Store normalized weights
         self.weights_ = best_weights / np.sum(best_weights)
 
-        # Store validation loss or other metrics
+        # Store validation loss
         self.validation_loss_ = -res.F[best_index, 0]  # Convert back to positive accuracy
+
+        # # Store validation robustness
+        # self.validation_robustness_ = res.F[best_index, 1]
 
         return self
     

@@ -509,13 +509,22 @@ class AskAssembler:
         return preds_to_keep
 
     # -- OS Utils
-    def _store_fold_predictors(self, fold_idx, ask_run_id, bm_config, val_y_pred, val_indices, test_y_pred,
-                            fit_time, predict_time, model_evaluated_time, bm_model): # Added bm_model parameter
+    def _store_fold_predictors(self, fold_idx, ask_run_id, bm_model, bm_config, val_y_pred, val_indices, test_y_pred,
+                               fit_time, predict_time, model_evaluated_time):
         store_dir = self.tmp_output_dir.joinpath("fold_{}/.ask_assembler".format(fold_idx))
-        predictor_dir = store_dir.joinpath("prediction_data") # Directory for prediction data
-        if not predictor_dir.exists():
-            os.mkdir(predictor_dir)
-
+        predictor_dir = store_dir.joinpath("prediction_data")
+        base_model_dir = store_dir.joinpath("base_models")
+        
+        # Ensure directories exist
+        predictor_dir.mkdir(parents=True, exist_ok=True) # Directory for prediction data
+        base_model_dir.mkdir(parents=True, exist_ok=True) # Directory for actual base models
+        
+        # Save base model
+        base_model_path = base_model_dir.joinpath("model_{}.pkl".format(ask_run_id))
+        with open(base_model_path, "wb") as f:
+            pickle.dump(bm_model, f)
+        
+        # Prepare predictor data
         predictor_data = {
             "bm_config": bm_config,
             "val_y_pred": val_y_pred,
@@ -523,18 +532,13 @@ class AskAssembler:
             "test_y_pred": test_y_pred,
             "fit_time": fit_time,
             "predict_time": predict_time,
-            "model_evaluated_time": model_evaluated_time
+            "model_evaluated_time": model_evaluated_time,
+            "base_model_path": str(base_model_path)  # Store path as a string
         }
+
+        # Save prediction data
         with open(predictor_dir.joinpath("model_{}.pkl".format(ask_run_id)), "wb") as f:
             pickle.dump(predictor_data, f)
-
-        base_models_dir = store_dir.joinpath("base_models") # Directory for base models
-        if not base_models_dir.exists():
-            os.mkdir(base_models_dir)
-
-        # Save base model in separate base_model directory
-        model_filename = base_models_dir.joinpath(f"bm_model_{ask_run_id}.joblib")
-        joblib.dump(bm_model, model_filename)
 
     def _load_predictor_data_for_metatask(self, fold_idx, ask_run_id, classes_=None):
         store_dir = self.tmp_output_dir.joinpath("fold_{}/.ask_assembler".format(fold_idx)).joinpath(
