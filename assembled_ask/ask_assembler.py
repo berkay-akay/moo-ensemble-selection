@@ -11,6 +11,7 @@ import hashlib
 import numpy as np
 import pynisher
 import math
+import joblib
 from heapq import heappush, heappop
 from shutil import rmtree
 from joblib import cpu_count, dump
@@ -129,7 +130,7 @@ class AskAssembler:
                                                                       delete_tmp_folder_after_terminate=False,
                                                                       ensemble_size=0,
                                                                       max_models_on_disc=max_models_on_disc,
-                                                                      load_models=False,
+                                                                      load_models=True, # TODO: Was False before
                                                                       resampling_strategy=resampling_strategy
                                                                       )
             logger.info("Start Search")
@@ -257,7 +258,16 @@ class AskAssembler:
                 # -- Store Data
                 logger.info("Store Predictor Data")
                 self._store_fold_predictors(fold_idx, ask_run_id, bm_config, val_y_pred, val_indices, test_y_pred,
-                                            fit_time, predict_time, model_evaluated_time, bm_model) # Added bm_model parameter (to be able to save model to disk)
+                                            fit_time, predict_time, model_evaluated_time)
+
+                # -- Store Base Model
+                base_model_dir = base_dir.joinpath(".ask_assembler/base_models")
+                
+                base_model_dir.mkdir(parents=True, exist_ok=True)
+                base_model_path = base_model_dir.joinpath("model_{}.pkl".format(ask_run_id))
+                with open(base_model_path, "wb") as f:
+                    pickle.dump(bm_model, f)
+
 
             # -- Store fold errors
             logger.info("Found the following Errors with Auto-sklearn: {}".format(ask_errors_[fold_idx]))
@@ -509,7 +519,7 @@ class AskAssembler:
         return preds_to_keep
 
     # -- OS Utils
-    def _store_fold_predictors(self, fold_idx, ask_run_id, bm_model, bm_config, val_y_pred, val_indices, test_y_pred,
+    def _store_fold_predictors(self, fold_idx, ask_run_id, bm_config, val_y_pred, val_indices, test_y_pred,
                                fit_time, predict_time, model_evaluated_time):
         store_dir = self.tmp_output_dir.joinpath("fold_{}/.ask_assembler".format(fold_idx))
         predictor_dir = store_dir.joinpath("prediction_data")
@@ -517,12 +527,16 @@ class AskAssembler:
         
         # Ensure directories exist
         predictor_dir.mkdir(parents=True, exist_ok=True) # Directory for prediction data
-        base_model_dir.mkdir(parents=True, exist_ok=True) # Directory for actual base models
+        logger.info("Prediction data directory created")
+        # base_model_dir.mkdir(parents=True, exist_ok=True) # Directory for actual base models
+        # logger.info("Base model directory created")
+
         
         # Save base model
         base_model_path = base_model_dir.joinpath("model_{}.pkl".format(ask_run_id))
-        with open(base_model_path, "wb") as f:
-            pickle.dump(bm_model, f)
+        # with open(base_model_path, "wb") as f:
+        #     pickle.dump(bm_model, f)
+
         
         # Prepare predictor data
         predictor_data = {
@@ -533,7 +547,7 @@ class AskAssembler:
             "fit_time": fit_time,
             "predict_time": predict_time,
             "model_evaluated_time": model_evaluated_time,
-            "base_model_path": str(base_model_path)  # Store path as a string
+            "base_model_path": str(base_model_path)  # Store path as a string !!!
         }
 
         # Save prediction data
