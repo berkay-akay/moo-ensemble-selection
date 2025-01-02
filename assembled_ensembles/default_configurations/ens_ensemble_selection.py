@@ -89,3 +89,25 @@ def _factory_qdo(rng_seed, metric, is_binary, labels, n_jobs, archive_type, beha
         },
         "pre_fit_base_models": True
     }
+
+
+def _factory_moo(rng_seed, metric, is_binary, labels, n_jobs,
+                 n_generations, population_size):
+    """
+    Returns the dict describing how to construct MOOEnsembleSelection
+    so that evaluate_ensemble_on_metatask(...) can instantiate and run it.
+    """
+    from assembled_ensembles.methods.moo.moo_es import MOOEnsembleSelection
+    from numpy.random import RandomState
+
+    return {
+        "technique": MOOEnsembleSelection,
+        "technique_args": {
+            "score_metric": metric,
+            "n_generations": n_generations,
+            "population_size": population_size,
+            "random_state": RandomState(rng_seed),
+            "n_jobs": n_jobs
+        },
+        "pre_fit_base_models": True # Pipeline will load (un-pickle) all base models before calling MOOEnsembleSelection(...).fit(...)
+    }
