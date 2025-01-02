@@ -20,5 +20,11 @@ def get_ensemble_switch_case_config(config, rng_seed=None, metric=None, n_jobs=N
             config["weight_random_elite_selection"], config["weight_random_step_selection"],
             config["buffer_ratio"], config["dynamic_updates_consider_rejections"], config["batch_size"]
         )
+    elif method == "MOOEnsembleSelection":
+        return ens_ensemble_selection._factory_moo(
+            rng_seed, metric, is_binary, labels, n_jobs,
+            config["n_generations"],
+            config["population_size"],
+        )
     else:
         raise ValueError(f"Unknown method! Got: {method}")
