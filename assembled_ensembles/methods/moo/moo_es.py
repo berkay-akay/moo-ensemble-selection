@@ -1,3 +1,5 @@
+import os
+import sys
 from assembled_ensembles.wrapper.abstract_ensemble import AbstractEnsemble
 import numpy as np
 from typing import List, Optional, Callable, Union
@@ -11,6 +13,7 @@ from pymoo.factory import get_algorithm
 from pymoo.optimize import minimize
 
 # Import moo problem definition for Pymoo 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from moo_ensemble_problem import MOOEnsembleProblem
 
 # ART Imports for adversarial robustness evaluation
@@ -54,7 +57,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         self.n_jobs = n_jobs
 
     
-    def fit(self, base_models_predictions: List[np.ndarray], labels: np.ndarray, X: np.ndarray) -> 'MOOEnsembleSelection': # Rename to "fit", because in evaluate_ensemble_on_metatask the method that is called for the EnsembleSelectionMethodObject is "fit"
+    def fit(self, X, y) -> 'MOOEnsembleSelection': # Rename to "fit", because in evaluate_ensemble_on_metatask the method that is called for the EnsembleSelectionMethodObject is "fit"
         """
         Loads actual base models. 
         Defines optimization problem by creating an instance of MOOEnsembleProblem. 
@@ -65,12 +68,11 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
 
         Parameters
         ----------
-        base_models_predictions: List[np.ndarray]
-            List of predictions from base models on validation data.
-        labels: np.ndarray
-            True labels of the validation data.
+
         X: np.ndarray
-            Input features of the validation data.
+            Training data.
+        y: np.ndarray
+            True labels of training data.
 
         Returns
         -------
@@ -79,15 +81,51 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         # Number of base models
         n_base_models = len(self.base_models)
 
-        # Load actual base models using paths from predictor descriptions
+        # # ONLY FOR DEBUGGING !!!
+        # # Inspect the attributes of each base model in self.base_models
+        # for idx, predictor in enumerate(self.base_models):
+        #     print(f"Base model {idx + 1} attributes:")
+        #     # Print all attributes of the fake base model
+        #     print(dir(predictor))
+
+        #     # If the predictor has a __dict__ attribute (custom attributes), print its contents
+        #     if hasattr(predictor, '__dict__'):
+        #         print("Custom attributes in __dict__:")
+        #         for key, value in predictor.__dict__.items():
+        #             print(f"  {key}: {value}")
+
+        #     # If description is present, print its contents
+        #     if hasattr(predictor, 'description'):
+        #         print("Description attribute:")
+        #         print(predictor.description)
+
+        #     print("\n" + "="*40 + "\n")  # Separator between base models
+
+
+        # Load actual base models using paths from predictor metadata
         actual_base_models = []
         for predictor in self.base_models:
-            base_model_path = predictor.description.get("base_model_path")
+            # Access model metadata from fake base model
+            model_metadata = getattr(predictor, "model_metadata", None)
+            if model_metadata is None:
+                raise ValueError("Fake base model does not contain model_metadata")
+
+            # Retrieve base_model_path from the metadata
+            base_model_path = model_metadata.get("base_model_path")
             if base_model_path is None:
-                raise ValueError("Base model path not found in predictor description.")
+                raise ValueError("Fake base model does not contain base_model_path")
+
+            # Load the actual base model from the stored path
             with open(base_model_path, "rb") as f:
                 base_model = pickle.load(f)
                 actual_base_models.append(base_model)
+
+
+        # Use actual base models to predict on training data
+        base_models_predictions = []
+        for actual_base_model in actual_base_models:
+            base_models_predictions.append(actual_base_model.predict_proba(X))
+
 
         # Create instance of MOOEnsembleProblem
         problem = MOOEnsembleProblem(
@@ -129,6 +167,8 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         # self.validation_robustness_ = res.F[best_index, 1]
 
         return self
+
+
     
     def predict_proba(self, X):
         """
