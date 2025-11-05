@@ -107,7 +107,8 @@ def _factory_moo(rng_seed, metric, is_binary, labels, n_jobs,
             "n_generations": n_generations,
             "population_size": population_size,
             "random_state": RandomState(rng_seed),
-            "n_jobs": n_jobs
+            "n_jobs": n_jobs,
+            "passthrough": True,
         },
         "pre_fit_base_models": True # Pipeline will load (un-pickle) all base models before calling MOOEnsembleSelection(...).fit(...)
     }

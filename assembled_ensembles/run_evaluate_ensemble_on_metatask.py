@@ -3,6 +3,12 @@ import os
 
 sys.path.insert(1, os.path.join(sys.path[0], ".."))  # have to do this because of singularity. I hate it
 
+# logging config for ART
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
+for name in ("art", "art.attacks", "art.attacks.evasion"):
+    logging.getLogger(name).setLevel(logging.INFO)
+
 from pathlib import Path
 
 from assembled.metatask import MetaTask

@@ -22,10 +22,10 @@ def get_qdo_config_space(seed_function_individual_fold):
     cond_3 = EqualsCondition(hp_archive_type, hp_methods, "QDOEnsembleSelection")
 
     # Hyperparameters for MOOEnsembleSelection (first idea, not final)
-    hp_n_generations = Categorical("n_generations", [10, 20, 50])
+    hp_n_generations = Categorical("n_generations", [1, 2, 10, 20, 50])
     cond_n_generations = EqualsCondition(hp_n_generations, hp_methods, "MOOEnsembleSelection")
 
-    hp_population_size = Categorical("population_size", [50, 100, 200])
+    hp_population_size = Categorical("population_size", [2, 8, 50, 100, 200])
     cond_population_size = EqualsCondition(hp_population_size, hp_methods, "MOOEnsembleSelection")
 
 
