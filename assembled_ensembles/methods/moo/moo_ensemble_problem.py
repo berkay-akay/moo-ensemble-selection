@@ -33,11 +33,11 @@ class EnsembleSklearnWrapper(BaseEstimator, ClassifierMixin):
     Parameters
     ----------
     base_models : list
-        Unpickled sklearn pipelines/estimators with `predict_proba`.
-    weights : np.ndarray, shape (n_models,)
+        Unpickled sklearn pipelines with 'predict_proba'.
+    weights : np.ndarray
         Ensemble weights (will be normalized if not summing to 1).
     classes_ : np.ndarray
-        Class labels array (as used by the base models / label encoder).
+        Class labels array (as used by the base models).
     feature_names : Optional[List[str]]
         Column names used during training. If provided, X is wrapped into a DataFrame with these columns.
     """
@@ -48,7 +48,7 @@ class EnsembleSklearnWrapper(BaseEstimator, ClassifierMixin):
         self.classes_ = np.asarray(classes_) if classes_ is not None else None
         self.feature_names = list(feature_names) if feature_names is not None else None
 
-    # --- sklearn estimator API ---
+    # Implementation according to sklearn estimator API
     def fit(self, X=None, y=None):
         """fit to satisfy sklearn’s estimator API.
         The wrapper does not train the base models, it only combines them.
@@ -59,13 +59,12 @@ class EnsembleSklearnWrapper(BaseEstimator, ClassifierMixin):
         return self
 
     def get_params(self, deep=True):
-        # BaseEstimator already provides this, but being explicit is fine
         return {}
 
     def set_params(self, **params):
         return self
 
-    # helper function
+    # Helper function
     def _ensure_X(self, X):
         if self.feature_names is not None:
             try:
@@ -74,7 +73,6 @@ class EnsembleSklearnWrapper(BaseEstimator, ClassifierMixin):
                 return X
         return X
 
-    # sklearn prediction API
     def predict_proba(self, X):
         if self.classes_ is None:
             raise ValueError("'classes_' is not set; call fit() or provide classes_ in __init__.")
@@ -95,7 +93,6 @@ class EnsembleSklearnWrapper(BaseEstimator, ClassifierMixin):
         proba = self.predict_proba(X)
         idx = np.argmax(proba, axis=1)
         return self.classes_[idx]
-
 
 
 class MOOEnsembleProblem(Problem):
@@ -125,7 +122,7 @@ class MOOEnsembleProblem(Problem):
 
     TODO: Add parameter for deciding which adversarial attack to use for robustness evaluation.
           Add parameter for final ensemble selection (value between 0 and 1 to prioritize either accuracy or robustness).
-          For the first approach return the full Pareto front.
+          For the first approach return the candidate in the final generation with the highest accuracy.
     """
 
     def __init__(self, n_base_models: int, predictions: List[np.ndarray], labels: np.ndarray,
@@ -175,7 +172,7 @@ class MOOEnsembleProblem(Problem):
 
         # Iterate over weight vectors in population/batch
         for weights in x:
-            # Normalize weights (to sum to 1)
+            # Normalize weights
             weights = weights / np.sum(weights)
 
             # Aggregate ensemble predictions using weights
@@ -217,7 +214,7 @@ class MOOEnsembleProblem(Problem):
     def _evaluate_robustness(self, weights: np.ndarray) -> float:
         """
         Evaluate robustness of ensemble using ART black-box attack
-        Returns adversarial accuracy (higher is better).
+        Returns adversarial accuracy.
         """
         # If skip_attack flag is set to true skip attacks and return dummy data
         if getattr(self, "skip_attack", False):
@@ -236,6 +233,7 @@ class MOOEnsembleProblem(Problem):
             root.setLevel(logging.INFO)
         for name in ("art", "art.attacks", "art.attacks.evasion"):
             logging.getLogger(name).setLevel(logging.INFO)
+
         # Try to recover original feature names from metadata (from fake base models)
         feature_names = None
         try:
@@ -250,7 +248,7 @@ class MOOEnsembleProblem(Problem):
         except Exception:
             feature_names = None
 
-        # Build sklearn-compatible ensemble wrapper around your unpickled base models
+        # Build sklearn-compatible ensemble wrapper around unpickled base models
         ensemble_model = EnsembleSklearnWrapper(
             base_models=self.base_models,
             weights=weights,
@@ -268,7 +266,7 @@ class MOOEnsembleProblem(Problem):
         logging.getLogger("art.attacks.evasion").setLevel(logging.INFO)
 
         print("[RobustnessEval] entering _evaluate_robustness")
-        # Wrap with ART and run a black-box attack (use BlackBoxClassifier to avoid sklearn type constraints)
+        # Wrap with ART and run a black-box attack
         pred_with_logging = PredictLogger(ensemble_model.predict_proba, max_eval=10000, name="HSJ")
         x_min = float(np.min(self.X))
         x_max = float(np.max(self.X))
@@ -281,7 +279,6 @@ class MOOEnsembleProblem(Problem):
         print(f"[RobustnessEval] clip_values set to: {classifier.clip_values}", flush=True)
         print("[RobustnessEval] built / wrapped classifier")
         print("[RobustnessEval] starting attack.generate | X shape:", getattr(self.X, 'shape', None), flush=True)
-
         # Instantiate adversarial attack
         attack = HopSkipJump(   # values for testing purposes
             classifier=classifier,
@@ -297,7 +294,7 @@ class MOOEnsembleProblem(Problem):
         print("[RobustnessEval] attack.generate DONE", flush=True)
         adv_preds = classifier.predict(x_test_adv)
 
-        # Convert to labels if your score_metric expects labels
+        # Convert to labels if score_metric expects labels
         y_idx = np.argmax(adv_preds, axis=1)
         y_pred = self.classes_[y_idx]
         adv_accuracy = self.score_metric(self.labels, y_pred, to_loss=False, checks=False)

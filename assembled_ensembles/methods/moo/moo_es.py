@@ -147,9 +147,9 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         ----------
 
         X: np.ndarray
-            Training data.
-        y: np.ndarray
-            True labels of training data.
+            Validation data.
+        labels: np.ndarray
+            True labels of validation data.
 
         Returns
         -------
@@ -157,26 +157,6 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         """
         # Number of base models
         n_base_models = len(self.base_models)
-
-        # # ONLY FOR DEBUGGING !!!
-        # # Inspect the attributes of each base model in self.base_models
-        # for idx, predictor in enumerate(self.base_models):
-        #     print(f"Base model {idx + 1} attributes:")
-        #     # Print all attributes of the fake base model
-        #     print(dir(predictor))
-
-        #     # If the predictor has a __dict__ attribute (custom attributes), print its contents
-        #     if hasattr(predictor, '__dict__'):
-        #         print("Custom attributes in __dict__:")
-        #         for key, value in predictor.__dict__.items():
-        #             print(f"  {key}: {value}")
-
-        #     # If description is present, print its contents
-        #     if hasattr(predictor, 'description'):
-        #         print("Description attribute:")
-        #         print(predictor.description)
-
-        #     print("\n" + "="*40 + "\n")  # Separator between base models
 
         # Load actual base models using paths from predictor metadata
         actual_base_models = []
@@ -220,7 +200,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
                 # If pandas is unavailable or columns mismatch, fall back to ndarray
                 X_for_models = X
 
-        # Use actual base models to predict on training data
+        # Use actual base models to predict on validation data
         base_models_predictions = []
         for actual_base_model in actual_base_models:
             base_models_predictions.append(actual_base_model.predict_proba(X_for_models))
@@ -272,8 +252,8 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         # Validation score(s) from optimization (convert −accuracy back to accuracy)
         self.val_loss_over_iterations_ = [float(-f[0]) for f in np.atleast_2d(res.F)]
 
-        # # Store validation robustness
-        # self.validation_robustness_ = res.F[best_index, 1]
+        # Store validation robustness ( !!! has to be modified to be saved to disk after run)
+        self.validation_robustness_ = -res.F[best_index, 1] # Negate since Pymoo minimizes
 
         return self
 
