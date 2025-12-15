@@ -4,12 +4,13 @@ from assembled_ensembles.wrapper.abstract_ensemble import AbstractEnsemble
 import numpy as np
 # Needs to be done for bugfixing (because we had to downgrade NumPy)
 import warnings as _pywarnings
-
 if not hasattr(np, "warnings"):
     np.warnings = _pywarnings
+
 from typing import List, Optional, Callable, Union
 from assembled_ensembles.wrapper.abstract_weighted_ensemble import \
-    AbstractWeightedEnsemble  # Abstract class for ensemble selection methods
+    AbstractWeightedEnsemble
+from assembled_ensembles.methods.moo.moo_ensemble_problem import EnsembleSklearnWrapper, PredictLogger
 from assembled_ensembles.util.metrics import AbstractMetric
 from sklearn.utils import check_random_state
 import pickle
@@ -26,7 +27,8 @@ from moo_ensemble_problem import MOOEnsembleProblem
 from art.attacks.evasion import BoundaryAttack
 from art.estimators.classification import SklearnClassifier
 from assembled_ask.util.metatask_base import get_metatask
-import numpy as np
+from art.estimators.classification import BlackBoxClassifier
+from art.attacks.evasion import HopSkipJump
 
 
 def _get_val_data_from_metatask(mt,
@@ -111,7 +113,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         if not hasattr(self, "weights_"):
             raise RuntimeError("Ensemble not fitted; call fit before predict.")
 
-        # Recover feature names if available
+        # Recover feature names
         feature_names = None
         try:
             if getattr(self, 'base_models_metadata_exists', False) and hasattr(self, 'base_models_metadata_'):
@@ -159,6 +161,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         n_base_models = len(self.base_models)
 
         # Load actual base models using paths from predictor metadata
+        print("[MOO-ES] Start loading base models from metadata", flush=True)
         actual_base_models = []
         for predictor in self.base_models:
             # Access model metadata from fake base model
@@ -168,7 +171,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
 
             # Retrieve base_model_path from the metadata
             base_model_path = model_metadata.get("base_model_path")
-            print("Base Model Path: ", base_model_path)  # Debugging
+            # print("Base Model Path: ", base_model_path)  # Debugging
             if base_model_path is None:
                 raise ValueError("Fake base model does not contain base_model_path")
 
@@ -176,8 +179,9 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             with open(base_model_path, "rb") as f:
                 base_model = pickle.load(f)
             actual_base_models.append(base_model)
-            print(f"Appended Model: {type(base_model)}")  # Debugging (Model Metadata: {model_metadata})
+            # print(f"Appended Model: {type(base_model)}")  # Debugging (Model Metadata: {model_metadata})
 
+        print("[MOO-ES] Finished loading base models from metadata", flush=True)
         # Save the loaded actual base models
         self.base_models = actual_base_models
 
@@ -197,7 +201,6 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
                 import pandas as pd
                 X_for_models = pd.DataFrame(X, columns=list(feature_names))
             except Exception:
-                # If pandas is unavailable or columns mismatch, fall back to ndarray
                 X_for_models = X
 
         # Use actual base models to predict on validation data
@@ -205,7 +208,98 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         for actual_base_model in actual_base_models:
             base_models_predictions.append(actual_base_model.predict_proba(X_for_models))
 
-        # Create instance of MOOEnsembleProblem
+        # Precompute adversarial union pool and caches
+        print("[MOO-ES] Starting precomputation of adversarial union pool (per base model attacks)", flush=True)
+
+        # Get feature names for consistent input schema
+        feature_names_for_attack = None
+        try:
+            if getattr(self, 'base_models_metadata_exists', False) and hasattr(self, 'base_models_metadata_'):
+                meta0 = self.base_models_metadata_[0] if len(self.base_models_metadata_) > 0 else None
+                if isinstance(meta0, dict):
+                    feature_names_for_attack = meta0.get('feature_names') or meta0.get('columns') or meta0.get('feature_names_in_')
+        except Exception:
+            feature_names_for_attack = None
+
+        # Build per-model perturbed validation set using HopSkipJump
+        X_attack_in = X
+        if feature_names_for_attack is not None:
+            try:
+                import pandas as pd
+                X_attack_in = pd.DataFrame(X, columns=list(feature_names_for_attack))
+            except Exception:
+                X_attack_in = X
+
+        perturbed_sets = []  # list to store perturbed validation sets
+        origin_idx = []      # origin model index (needed to use ensemble weightening during optimization)
+
+        # Use per-feature bounds / clip-values
+        X_np = np.asarray(X, dtype=np.float32)
+        feat_min = X_np.min(axis=0)
+        feat_max = X_np.max(axis=0)
+        # Avoid zero-range features
+        same = feat_max <= feat_min
+        feat_max[same] = feat_min[same] + 1e-8
+        print(f"[MOO-ES] Using per-feature clip_values with shapes: {feat_min.shape}, {feat_max.shape}", flush=True)
+
+        # Define max-eval parameter for HSJ
+        HSJ_MAX_EVAL=20
+
+        for m_idx, bm in enumerate(actual_base_models):
+            print(f"[MOO-ES] Generating adversarial set for base model {m_idx}", flush=True)
+            wrapper = EnsembleSklearnWrapper(
+                base_models=[bm],
+                weights=np.array([1.0], dtype=float),
+                classes_=self.classes_,
+                feature_names=feature_names_for_attack,
+            ).fit()
+            pred_with_logging = PredictLogger(wrapper.predict_proba, max_eval=X_np.shape[0] * HSJ_MAX_EVAL, name=f"HSJ_bm{m_idx}")
+            clf = BlackBoxClassifier(
+                pred_with_logging,
+                input_shape=(X_np.shape[1],),
+                nb_classes=len(self.classes_),
+                clip_values=(feat_min, feat_max),
+            )
+            attack = HopSkipJump(
+                classifier=clf,
+                targeted=False,
+                max_iter=5,
+                max_eval=HSJ_MAX_EVAL,
+                init_eval=10,
+                init_size=5,
+                verbose=True
+            )
+            x_adv = attack.generate(x=X_np)
+            perturbed_sets.append(x_adv)
+            origin_idx.append(np.full(x_adv.shape[0], m_idx, dtype=int))
+            print(f"[MOO-ES] Done generating adversarial set for model {m_idx}", flush=True)
+
+        # Build union pool U and labels
+        U = np.vstack(perturbed_sets) if len(perturbed_sets) > 0 else np.empty_like(X)
+        # Set true labels (repeat labels once for each base model / perturbed validation set)
+        U_labels = np.hstack([labels for _ in range(len(perturbed_sets))]) if len(perturbed_sets) > 0 else labels.copy()
+        # Store base model index (could be used for origin-aware weighting later on)
+        U_origin = np.hstack(origin_idx) if len(origin_idx) > 0 else np.zeros(len(labels), dtype=int)
+        print(f"[MOO-ES] Built union pool U with shape {getattr(U, 'shape', None)}", flush=True)
+
+        # Cache base model predictions on U
+        adv_union_predictions = []  # will become (n_models, n_union, n_classes)
+
+        # Ensure schema (feature names)
+        U_for_models = U
+        if feature_names_for_attack is not None:
+            try:
+                import pandas as pd
+                U_for_models = pd.DataFrame(U, columns=list(feature_names_for_attack))
+            except Exception:
+                U_for_models = U
+        for j, bm in enumerate(actual_base_models):
+            print(f"[MOO-ES] Caching predict_proba on U for base model {j}", flush=True)
+            adv_union_predictions.append(bm.predict_proba(U_for_models))
+        adv_union_predictions = np.asarray(adv_union_predictions)
+        print(f"[MOO-ES] Cached adv_union_predictions with shape {adv_union_predictions.shape}", flush=True)
+
+        # Create instance of MOOEnsembleProblem (use surrogate robustness via adv caches)
         problem = MOOEnsembleProblem(
             n_base_models=n_base_models,
             predictions=base_models_predictions,
@@ -218,7 +312,8 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             classes_=self.classes_,
             base_models_metadata=(
                 self.base_models_metadata_ if getattr(self, 'base_models_metadata_exists', False) else None),
-            skip_attack=True,  # !!! Only for testing purposes
+            adv_union_predictions=adv_union_predictions,
+            adv_union_labels=U_labels,
         )
 
         # Configure population size of NSGA-II algorithm
@@ -233,28 +328,65 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             verbose=True
         )
 
-        # Extract Pareto front solutions
-        # For now, select the solution with the lowest negative accuracy (highest accuracy)
-        # Since we minimized negative accuracy, we find the index with the lowest 'F' value in the first column
-        best_index = np.argmin(
-            res.F[:, 0])  # Minimize negative accuracy (column 0 for accuracy, column 1 for robustness)
-        best_weights = res.X[best_index]  # Get corresponding weights
+        # Extract Pareto front weights and metrics
+        pareto_weights = np.atleast_2d(res.X)
+        pareto_obj = np.atleast_2d(res.F)
+        pareto_acc = (-pareto_obj[:, 0]).astype(float)
+        pareto_robust_surr = (-pareto_obj[:, 1]).astype(float)
+
+        print(f"[MOO-ES] Number of Pareto-optimal ensembles: {len(pareto_weights)}", flush=True)
+        for i, (a, r) in enumerate(zip(pareto_acc, pareto_robust_surr)):
+            print(f"[MOO-ES] Pareto-optimal ensemble (surrogate) idx={i} | accuracy={a:.6f} | adv_acc_surr={r:.6f}", flush=True)
+
+        # Re-attack Pareto-optimal ensembles to obtain true robustness
+        print("[MOO-ES] Re-attacking Pareto-optimal ensembles to compute true robustness", flush=True)
+        true_robust_list = []
+        for i, w in enumerate(pareto_weights):
+            w = np.asarray(w, dtype=float)
+            if w.sum() == 0:
+                w = np.ones_like(w) / len(w)
+            else:
+                w = w / w.sum()
+            print(f"[MOO-ES] Re-attack ensemble {i} ...", flush=True)
+            try:
+                adv_acc_true = float(problem._evaluate_robustness(w))
+            except Exception as e:
+                print(f"[MOO-ES] WARNING: re-attack failed for candidate {i}: {e}", flush=True)
+                adv_acc_true = float('nan')
+            true_robust_list.append(adv_acc_true)
+            print(f"[MOO-ES] true_adv_accuracy={adv_acc_true}", flush=True)
+        pareto_robust_true = np.asarray(true_robust_list, dtype=float)
+
+        # Select final solution by highest accuracy
+        best_index = int(np.argmax(pareto_acc))
+        best_weights = pareto_weights[best_index]
 
         # Store normalized weights
         self.weights_ = best_weights / np.sum(best_weights)
 
-        # Store validation loss
-        self.validation_loss_ = -res.F[best_index, 0]  # Convert back to positive accuracy
+        # Store validation loss (here it is actually the selected accuracy)
+        self.validation_loss_ = float(pareto_acc[best_index])
 
         # Number of solutions evaluated per iteration (use NSGA‑II population size)
         self.iteration_batch_size_ = int(self.population_size)
 
         # Validation score(s) from optimization (convert −accuracy back to accuracy)
-        self.val_loss_over_iterations_ = [float(-f[0]) for f in np.atleast_2d(res.F)]
+        self.val_loss_over_iterations_ = [float(a) for a in pareto_acc]
 
-        # Store validation robustness ( !!! has to be modified to be saved to disk after run)
-        self.validation_robustness_ = -res.F[best_index, 1] # Negate since Pymoo minimizes
+        # Store (true) robustness for the selected solution
+        self.validation_robustness_ = float(pareto_robust_true[best_index])
 
+        # Store metadata (is saved to disk under benchmark/output)
+        self.model_specific_metadata_.update(dict(
+            selection_rule="by_accuracy",
+            surrogate_pool_size=int(len(pareto_robust_surr) and getattr(adv_union_predictions, 'shape', [0,0,0])[1] or 0),
+            pareto_accuracy=[float(v) for v in pareto_acc.tolist()],
+            pareto_surrogate_robustness=[float(v) for v in pareto_robust_surr.tolist()],
+            pareto_true_robustness=[None if np.isnan(v) else float(v) for v in pareto_robust_true.tolist()],
+            selected_index=int(best_index),
+            selected_accuracy=float(pareto_acc[best_index]),
+            selected_robustness_true=None if np.isnan(pareto_robust_true[best_index]) else float(pareto_robust_true[best_index]),
+        ))
         return self
 
     def predict_proba(self, X):

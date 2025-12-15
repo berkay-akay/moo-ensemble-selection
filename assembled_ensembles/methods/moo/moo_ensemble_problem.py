@@ -104,21 +104,27 @@ class MOOEnsembleProblem(Problem):
     n_base_models: int
         Number of base models in the ensemble.
     predictions: List[np.ndarray]
-        List of predictions from base models.
+        List of predictions from base models on the clean validation set (probabilities).
     labels: np.ndarray
-        True labels.
+        True labels of the validation set (encoded to match classes_).
     score_metric: AbstractMetric
-        Metric for accuracy evaluation.
+        Metric for accuracy evaluation (called with to_loss=False).
     base_models: List[Callable]
-        List of base model instances.
+        List of base model instances (unpickled sklearn pipelines).
     X: np.ndarray
         Data instances (with input features) from validation set.
     random_state: Optional[Union[int, np.random.RandomState]]
         Random state for reproducibility.
     n_jobs: int
         Number of jobs for parallel processing.
-    skip_attack : bool, default=False
-        Flag to skip the adversarial attack and return dummy data instead. Only for testing purposes.
+    classes_: Optional[np.ndarray]
+        Class labels as used by the models.
+    base_models_metadata: Optional[List[dict]]
+        Optional metadata from the fake predictors to help with feature names.
+    adv_union_predictions: np.ndarray
+        Cached adversarial predictions with shape (n_models, n_union, n_classes).
+    adv_union_labels: np.ndarray
+        Labels aligned with the union set (length n_union). Used to score the surrogate robustness.
 
     TODO: Add parameter for deciding which adversarial attack to use for robustness evaluation.
           Add parameter for final ensemble selection (value between 0 and 1 to prioritize either accuracy or robustness).
@@ -131,7 +137,8 @@ class MOOEnsembleProblem(Problem):
                  n_jobs: int = -1,
                  classes_: Optional[np.ndarray] = None,
                  base_models_metadata: Optional[List[dict]] = None,
-                 skip_attack: bool = False):
+                 adv_union_predictions: np.ndarray = None,
+                 adv_union_labels: np.ndarray = None):
         # Initialize the superclass (Pymoo problem)
         super().__init__(
             n_var=n_base_models,     # Number of decision variables (weights for base models)
@@ -151,8 +158,12 @@ class MOOEnsembleProblem(Problem):
         self.n_jobs = n_jobs
         self.classes_ = classes_
         self.base_models_metadata = base_models_metadata
-        self.skip_attack = bool(skip_attack)
-
+        # Cached adversarial predictions/labels for surrogate robustness (optional)
+        self.adv_union_predictions = adv_union_predictions  # (n_models, n_union, n_classes) or None
+        self.adv_union_labels = adv_union_labels            # (n_union,) or None
+        if self.adv_union_predictions is not None:
+            print(f"[MOOProblem] Using surrogate robustness on union set with shape: "
+                  f"{getattr(self.adv_union_predictions, 'shape', None)}", flush=True)
 
 
     def _evaluate(self, x, out, *args, **kwargs):
@@ -175,16 +186,19 @@ class MOOEnsembleProblem(Problem):
             # Normalize weights
             weights = weights / np.sum(weights)
 
-            # Aggregate ensemble predictions using weights
+            # Aggregate ensemble predictions using weights (CLEAN accuracy)
             ensemble_pred = self._ensemble_predict(self.predictions, weights)
 
             # Evaluate accuracy
             accuracy = self.score_metric(self.labels, ensemble_pred, to_loss=False, checks=False)
-            f1.append(-accuracy)  # Pymoo minimizes objective, so we need to negate (minimize negative accuracy = maximize accuracy)
+            f1.append(-accuracy)  # Pymoo minimizes objective, so we negate (maximize accuracy)
 
-            # Evaluate robustness (using adversarial attacks)
-            robustness = self._evaluate_robustness(weights)
-            f2.append(-robustness)  # Pymoo minimizes objective, so we need to negate (minimize negative robustness = maximize robustness)
+            # Evaluate surrogate robustness on precomputed union set
+            # adv_union_predictions: (n_models, n_union, n_classes)
+            # weights: (n_models,)
+            ensemble_adv_pred = np.tensordot(weights, self.adv_union_predictions, axes=(0, 0))  # (n_union, n_classes)
+            robustness = self.score_metric(self.adv_union_labels, ensemble_adv_pred, to_loss=False, checks=False)
+            f2.append(-robustness)  # negate (maximize robustness)
 
         # Store objective values in output dictionary
         out["F"] = np.column_stack([f1, f2])
@@ -216,11 +230,6 @@ class MOOEnsembleProblem(Problem):
         Evaluate robustness of ensemble using ART black-box attack
         Returns adversarial accuracy.
         """
-        # If skip_attack flag is set to true skip attacks and return dummy data
-        if getattr(self, "skip_attack", False):
-            dummy_adv_accuracy = 0.5
-            print("[RobustnessEval] SKIPPED adversarial attack; returning dummy adv_accuracy=0.5", flush=True)
-            return float(dummy_adv_accuracy)
 
         # logging for ART
         import logging
@@ -268,23 +277,31 @@ class MOOEnsembleProblem(Problem):
         print("[RobustnessEval] entering _evaluate_robustness")
         # Wrap with ART and run a black-box attack
         pred_with_logging = PredictLogger(ensemble_model.predict_proba, max_eval=10000, name="HSJ")
-        x_min = float(np.min(self.X))
-        x_max = float(np.max(self.X))
+
+        # Use per-feature bounds / clip-values
+        X = np.asarray(self.X)
+        feat_min = X.min(axis=0)
+        feat_max = X.max(axis=0)
+        # Prevent zero-range features from causing divide-by-zero or degenerate bounds
+        same = feat_max <= feat_min
+        feat_max[same] = feat_min[same] + 1e-8
+
         classifier = BlackBoxClassifier(
             pred_with_logging,
-            (self.X.shape[1],),
+            (X.shape[1],),
             len(self.classes_),
-            clip_values=(x_min, x_max),
+            clip_values=(feat_min.astype(np.float32), feat_max.astype(np.float32)),
         )
-        print(f"[RobustnessEval] clip_values set to: {classifier.clip_values}", flush=True)
+        print(f"[RobustnessEval] clip_values set to per-feature arrays with shapes: "
+              f"{classifier.clip_values[0].shape}, {classifier.clip_values[1].shape}", flush=True)
         print("[RobustnessEval] built / wrapped classifier")
         print("[RobustnessEval] starting attack.generate | X shape:", getattr(self.X, 'shape', None), flush=True)
         # Instantiate adversarial attack
         attack = HopSkipJump(   # values for testing purposes
             classifier=classifier,
             targeted=False,  # untargeted, so no need to pass y
-            max_iter=1,  # tune for speed/quality
-            max_eval=10,
+            max_iter=5,
+            max_eval=20,
             init_eval=10,
             init_size=5,
             verbose=True, # enable built-in logging
@@ -292,10 +309,8 @@ class MOOEnsembleProblem(Problem):
         # Generate adversarial examples and evaluate
         x_test_adv = attack.generate(x=self.X)
         print("[RobustnessEval] attack.generate DONE", flush=True)
-        adv_preds = classifier.predict(x_test_adv)
+        adv_preds = classifier.predict(x_test_adv)  # shape: (n_samples, n_classes)
 
-        # Convert to labels if score_metric expects labels
-        y_idx = np.argmax(adv_preds, axis=1)
-        y_pred = self.classes_[y_idx]
-        adv_accuracy = self.score_metric(self.labels, y_pred, to_loss=False, checks=False)
-        return adv_accuracy
+        # Use probabilities directly to score (and not class labels)
+        adv_accuracy = self.score_metric(self.labels, adv_preds, to_loss=False, checks=False)
+        return float(adv_accuracy)
