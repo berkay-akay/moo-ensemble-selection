@@ -5,25 +5,25 @@
 #SBATCH --mem=32G
 #SBATCH --partition=c23ms
 #SBATCH --chdir=/rwthfs/rz/cluster/hpcwork/ay047206/moo-ensemble-selection/assembled_ensembles
+#SBATCH --array=0-9
 #SBATCH --output=/rwthfs/rz/cluster/hpcwork/ay047206/logs/slurm-%x-%j.out
 #SBATCH --error=/rwthfs/rz/cluster/hpcwork/ay047206/logs/slurm-%x-%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=berkay.akay@rwth-aachen.de
-# #SBATCH -A rwthXXXX   # <-- uncomment & set if required by your project
 
 set -euo pipefail
 
 # Create log directory if missing
 mkdir -p "/rwthfs/rz/cluster/hpcwork/ay047206/logs"
 
-# Tee stdout/stderr to job-specific files as well
+# Tee stdout/stderr to job-specific files (include array task id to avoid collisions)
 LOGDIR="/rwthfs/rz/cluster/hpcwork/ay047206/logs"
-LOG_OUT="${LOGDIR}/${SLURM_JOB_NAME}-${SLURM_JOB_ID}.out"
-LOG_ERR="${LOGDIR}/${SLURM_JOB_NAME}-${SLURM_JOB_ID}.err"
+LOG_OUT="${LOGDIR}/${SLURM_JOB_NAME}-${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-NA}.out"
+LOG_ERR="${LOGDIR}/${SLURM_JOB_NAME}-${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-NA}.err"
 exec > >(tee -a "${LOG_OUT}") 2> >(tee -a "${LOG_ERR}" >&2)
 
 echo "========== SLURM START =========="
-echo "JobID=${SLURM_JOB_ID}  Name=${SLURM_JOB_NAME}  User=${SLURM_JOB_USER}  Acct=${SLURM_JOB_ACCOUNT:-N/A}"
+echo "JobID=${SLURM_JOB_ID}  ArrayTaskID=${SLURM_ARRAY_TASK_ID:-NA}  Name=${SLURM_JOB_NAME}  User=${SLURM_JOB_USER}  Acct=${SLURM_JOB_ACCOUNT:-N/A}"
 echo "Node(s)=${SLURM_JOB_NODELIST}  CPUs=${SLURM_CPUS_PER_TASK}  Mem=${SLURM_MEM_PER_NODE:-NA}"
 echo "Initial pwd=$(pwd)  SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-N/A}  TMPDIR=${TMPDIR:-N/A}"
 date
@@ -43,7 +43,7 @@ else
   exit 1
 fi
 
-# Activate the prebuilt environment (no installs here)
+# Activate the prebuilt environment
 conda activate py395-ensemble
 
 # Show interpreter info for sanity
@@ -64,41 +64,46 @@ if [ ! -f "${ENTRY}" ]; then
   exit 2
 fi
 
-# Make repo importable (if your code does relative imports)
+# Make repo importable
 export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
 
-# Helpful failure trap + command echo
 trap 'rc=$?; echo "FAILED with exit code ${rc} at $(date)"; exit $rc' ERR
 set -x
 
-# Parameters (kept explicit to match your interactive run)
-TASK_ID=-1
-DATASET_TECHNIQUE=SiloTopN
-METHOD="MOOEnsembleSelection|n_generations:1|population_size:2"
+# Parameters
+TASK_ID=59
+PRUNER=SiloTopN
+METHOD="MOOEnsembleSelection|n_generations:10|population_size:50"
 METRIC=balanced_accuracy
-METATASK=minimal_example_12
+METATASK=minimal_example_13
 STATE_NAME=ensemble_evaluations_qdo
-SAVE_VAL_PRED=no
-USE_CONF=no
-SEED=-1
-EVAL_MODE=QDO
-CONF_TAG=moo_conf_0
+ISOLATE=no
+LOAD_METHOD=eage
+FOLD_IDX=${SLURM_ARRAY_TASK_ID}
+CONFIG_SPACE=QDO
+CONF_TAG=moo_conf_1
 
-# Run using srun
-echo "========== RUN =========="
+
+# Run using srun - pass 12 args expected by run_evaluate_ensemble_on_metatask.py
+# Arg order:
+# 1 openml_task_id | 2 pruner | 3 ensemble_method_name | 4 metric_name | 5 benchmark_name
+# 6 evaluation_name | 7 isolate_execution("yes"/"no") | 8 load_method | 9 folds_to_run_on
+# 10 config_space_name | 11 ens_save_name
+
+echo "========== RUN (fold ${FOLD_IDX}) =========="
 srun python -u "${ENTRY}" \
   ${TASK_ID} \
-  ${DATASET_TECHNIQUE} \
+  ${PRUNER} \
   "${METHOD}" \
   ${METRIC} \
   ${METATASK} \
   ${STATE_NAME} \
-  ${SAVE_VAL_PRED} \
-  ${USE_CONF} \
-  ${SEED} \
-  ${EVAL_MODE} \
+  ${ISOLATE} \
+  ${LOAD_METHOD} \
+  ${FOLD_IDX} \
+  ${CONFIG_SPACE} \
   ${CONF_TAG}
 
 set +x
-echo "========== DONE =========="
+echo "========== DONE (fold ${FOLD_IDX}) =========="
 date
