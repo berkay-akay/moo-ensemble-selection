@@ -300,13 +300,12 @@ class MOOEnsembleProblem(Problem):
         attack = HopSkipJump(   # values for testing purposes
             classifier=classifier,
             targeted=False,  # untargeted, so no need to pass y
-            max_iter=5,
-            max_eval=20,
-            init_eval=10,
-            init_size=5,
+            max_iter=3,
+            max_eval=25,
+            init_eval=20,
+            init_size=3,
             verbose=True, # enable built-in logging
         )
-        # Generate adversarial examples and evaluate
         x_test_adv = attack.generate(x=self.X)
         print("[RobustnessEval] attack.generate DONE", flush=True)
         adv_preds = classifier.predict(x_test_adv)  # shape: (n_samples, n_classes)

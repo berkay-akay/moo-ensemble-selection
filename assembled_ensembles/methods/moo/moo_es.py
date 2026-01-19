@@ -31,6 +31,7 @@ from art.estimators.classification import BlackBoxClassifier
 from art.attacks.evasion import HopSkipJump
 
 
+
 def _get_val_data_from_metatask(mt,
                                 fold_idx):  # Currently not needed because we can just set passthrough = true to get access to the validation data
     """
@@ -243,7 +244,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         print(f"[MOO-ES] Using per-feature clip_values with shapes: {feat_min.shape}, {feat_max.shape}", flush=True)
 
         # Define max-eval parameter for HSJ
-        HSJ_MAX_EVAL=20
+        HSJ_MAX_EVAL=25
 
         for m_idx, bm in enumerate(actual_base_models):
             print(f"[MOO-ES] Generating adversarial set for base model {m_idx}", flush=True)
@@ -263,10 +264,10 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             attack = HopSkipJump(
                 classifier=clf,
                 targeted=False,
-                max_iter=5,
+                max_iter=3,
                 max_eval=HSJ_MAX_EVAL,
-                init_eval=10,
-                init_size=5,
+                init_eval=20,
+                init_size=3,
                 verbose=True
             )
             x_adv = attack.generate(x=X_np)

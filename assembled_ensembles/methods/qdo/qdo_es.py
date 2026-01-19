@@ -15,11 +15,13 @@ from assembled_ensembles.methods.qdo.custom_archives.quality_archive import Qual
 from assembled_ensembles.methods.qdo.custom_archives.custom_sliding_boundaries_archive import SlidingBoundariesArchive
 
 from functools import partial
+import pickle
 
 from concurrent.futures import ProcessPoolExecutor
 
 
 class QDOEnsembleSelection(AbstractWeightedEnsemble):
+    supports_passthrough = True
     """Using QDO to find a good weight vector for post hoc ensembling.
 
     Parameters
@@ -94,7 +96,9 @@ class QDOEnsembleSelection(AbstractWeightedEnsemble):
                  show_analysis=False, n_jobs: int = -1) -> None:
 
         # The following just tells our wrapper/supper that we want to have prediction probabilities as input for fit
+        # Enable passthrough to receive raw X,y for post-hoc robustness evaluation
         super().__init__(base_models, "predict_proba")
+        self.passthrough = True # tell AbstractEnsemble.fit to use the passthrough path
 
         # -- Iteration management
         self.n_iterations = n_iterations
@@ -421,6 +425,192 @@ class QDOEnsembleSelection(AbstractWeightedEnsemble):
             optimize_stats["Max Objective"].append(float(opt.archive.stats.obj_max))
 
         self.optimize_stats_ = optimize_stats
+
+    def _load_actual_base_models(self) -> List[Callable]:
+        """Load the actual sklearn base models from paths stored in the fake wrappers' metadata.
+        After loading, replace self.base_models with the actual estimators and return them.
+        """
+        actual_base_models: List[Callable] = []
+        for predictor in self.base_models:
+            model_metadata = getattr(predictor, "model_metadata", None)
+            if model_metadata is None:
+                raise ValueError("Fake base model does not contain model_metadata")
+            base_model_path = model_metadata.get("base_model_path")
+            if base_model_path is None:
+                raise ValueError("Fake base model does not contain base_model_path")
+            with open(base_model_path, "rb") as f:
+                base_model = pickle.load(f)
+            actual_base_models.append(base_model)
+        # Replace base models with the loaded ones
+        self.base_models = actual_base_models
+        return actual_base_models
+
+    def evaluate_robustness(self, X, y):
+        """Post-hoc adversarial robustness evaluation of the final ensemble (HSJ attack).
+        Stores adversarial accuracy in self.validation_robustness_ and logs params in self.model_specific_metadata_.
+        """
+        # Lazy imports to avoid overhead unless used
+        from assembled_ensembles.methods.moo.moo_ensemble_problem import (
+            EnsembleSklearnWrapper, PredictLogger,
+        )
+        from art.attacks.evasion import HopSkipJump
+        from art.estimators.classification import BlackBoxClassifier
+        import numpy as _np
+
+        # Normalize weights to sum to 1 to guard numerical drift
+        w = _np.asarray(self.weights_, dtype=float)
+        w_sum = _np.sum(w)
+        if not _np.isfinite(w_sum) or w_sum == 0:
+            raise ValueError("Invalid weights for robustness evaluation.")
+        w = w / w_sum
+
+        # Recover feature names from metadata if available
+        feature_names = None
+        try:
+            if getattr(self, 'base_models_metadata_exists', False) and hasattr(self, 'base_models_metadata_'):
+                meta0 = self.base_models_metadata_[0] if len(self.base_models_metadata_) > 0 else None
+                if isinstance(meta0, dict):
+                    feature_names = meta0.get('feature_names') or meta0.get('columns') or meta0.get('feature_names_in_')
+        except Exception:
+            feature_names = None
+
+        X_for_models = X
+        if feature_names is not None:
+            try:
+                import pandas as pd
+                X_for_models = pd.DataFrame(X, columns=list(feature_names))
+            except Exception:
+                X_for_models = X
+
+        # Compute per-feature clip values based on provided X
+        X_arr = _np.asarray(X_for_models if not hasattr(X_for_models, 'values') else X_for_models.values)
+        X_arr = X_arr.astype(_np.float32)
+        feat_min = X_arr.min(axis=0)
+        feat_max = X_arr.max(axis=0)
+        same = feat_max <= feat_min
+        feat_max[same] = feat_min[same] + 1e-8
+
+        # Build sklearn-compatible ensemble wrapper around actual base models
+        ensemble_model = EnsembleSklearnWrapper(
+            base_models=self.base_models,
+            weights=w,
+            classes_=self.classes_,
+            feature_names=feature_names,
+        )
+        ensemble_model.fit()
+
+        # ART black-box wrapper with logging
+        # Align PredictLogger budget with HSJ total query budget across all samples (n_samples * 25)
+        max_eval_budget = int(X_arr.shape[0]) * 25
+        pred_with_logging = PredictLogger(ensemble_model.predict_proba, max_eval=max_eval_budget, name="HSJ")
+        classifier = BlackBoxClassifier(
+            pred_with_logging,
+            (X_arr.shape[1],),
+            len(self.classes_),
+            clip_values=(feat_min.astype(_np.float32), feat_max.astype(_np.float32)),
+        )
+
+        attack = HopSkipJump(
+            classifier=classifier,
+            targeted=False,
+            max_iter=3,
+            max_eval=25,
+            init_eval=20,
+            init_size=3,
+            verbose=True,
+        )
+        # Always pass a float32 NumPy array to ART
+        X_adv = attack.generate(x=X_arr)
+        adv_preds = classifier.predict(x=X_adv)
+
+        adv_accuracy = self.score_metric(y, adv_preds, to_loss=False, checks=False)
+        self.validation_robustness_ = float(adv_accuracy)
+
+        # Update metadata
+        robustness_meta = dict(
+            robustness_attack="HopSkipJump",
+            attack_params=dict(max_iter=3, max_eval=25, init_eval=20, init_size=3, targeted=False),
+            n_samples=int(len(X_arr)),
+            n_classes=int(len(self.classes_)),
+            clip_values="per-feature",
+            weights=w.tolist(),
+            validation_robustness_=float(adv_accuracy),
+        )
+        # Do not overwrite existing metadata; extend it
+        if not hasattr(self, 'model_specific_metadata_') or self.model_specific_metadata_ is None:
+            self.model_specific_metadata_ = {}
+        self.model_specific_metadata_["robustness"] = robustness_meta
+
+        return float(adv_accuracy)
+
+    def ensemble_passthrough_fit(self, X, base_model_predictions, labels):
+        """Passthrough fit for QDO: keep original optimization on cached predictions,
+        then load actual base models and run post-hoc robustness evaluation.
+        """
+        # Step 1: run original optimizer using cached predictions
+        self.ensemble_fit(base_model_predictions, labels)
+        # Step 2: load real base models
+        self._load_actual_base_models()
+        # Step 3: evaluate robustness on raw features
+        self.evaluate_robustness(X, labels)
+        return self
+
+    def ensemble_passthrough_predict_proba(self, X, bm_preds):
+        """Return class probabilities for samples X using unpickled base models.
+        Ignores bm_preds and recomputes predictions from the actual sklearn models.
+        """
+        import numpy as np
+
+        # Ensure weights exist and normalize (fallback to uniform if degenerate)
+        if not hasattr(self, "weights_"):
+            raise RuntimeError("The ensemble has not been fitted yet (weights_ missing).")
+        w = np.asarray(self.weights_, dtype=float)
+        s = float(w.sum())
+        w = np.ones_like(w) / max(len(w), 1) if (not np.isfinite(s) or s <= 0.0) else (w / s)
+
+        # Ensure we use actual sklearn base models
+        try:
+            if any(getattr(bm, 'predict_proba', None) is None for bm in self.base_models):
+                self._load_actual_base_models()
+        except Exception:
+            self._load_actual_base_models()
+
+        # Recover feature names from metadata if available
+        feature_names = None
+        try:
+            if getattr(self, 'base_models_metadata_exists', False) and hasattr(self, 'base_models_metadata_'):
+                meta0 = self.base_models_metadata_[0] if len(self.base_models_metadata_) > 0 else None
+                if isinstance(meta0, dict):
+                    feature_names = (
+                            meta0.get('feature_names')
+                            or meta0.get('columns')
+                            or meta0.get('feature_names_in_')
+                    )
+        except Exception:
+            feature_names = None
+
+        # Wrap X into a DataFrame to keep original column names (preprocessing compatibility)
+        X_for_models = X
+        if feature_names is not None:
+            try:
+                import pandas as pd
+                X_for_models = pd.DataFrame(X, columns=list(feature_names))
+            except Exception:
+                X_for_models = X
+
+        # Get base model probs and combine with ensemble combiner
+        base_models_predictions = [bm.predict_proba(X_for_models) for bm in self.base_models]
+        # Use the existing combiner from AbstractWeightedEnsemble
+        return self.ensemble_predict_proba(base_models_predictions)
+
+    def ensemble_passthrough_predict(self, X, bm_preds):
+        """Return label predictions for samples X (uses probs -> labels)."""
+        import numpy as np
+        from assembled_ensembles.wrapper.abstract_weighted_ensemble import AbstractWeightedEnsemble
+
+        proba = self.ensemble_passthrough_predict_proba(X, bm_preds)
+        # Convert probabilities to label indices using the base helper, then let the wrapper inverse_transform
+        return AbstractWeightedEnsemble._confidences_to_predictions(proba)
 
     def _compute_weights(self, predictions, labels):
         """Code to compute the final weight vector (among other things)
