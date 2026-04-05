@@ -1,6 +1,6 @@
 #!/usr/bin/zsh
 #SBATCH --job-name=moo_es
-#SBATCH --time=12:00:00
+#SBATCH --time=08:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --partition=c23ms
@@ -10,6 +10,7 @@
 #SBATCH --error=/rwthfs/rz/cluster/hpcwork/ay047206/logs/slurm-%x-%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=berkay.akay@rwth-aachen.de
+#SBATCH -A thes2190
 
 set -euo pipefail
 
@@ -43,7 +44,7 @@ else
   exit 1
 fi
 
-# Activate the prebuilt environment
+# Activate the prebuilt environment (no installs here)
 conda activate py395-ensemble
 
 # Show interpreter info for sanity
@@ -71,11 +72,11 @@ trap 'rc=$?; echo "FAILED with exit code ${rc} at $(date)"; exit $rc' ERR
 set -x
 
 # Parameters
-TASK_ID=59
+TASK_ID=146818
 PRUNER=SiloTopN
 METHOD="MOOEnsembleSelection|n_generations:10|population_size:50"
 METRIC=balanced_accuracy
-METATASK=minimal_example_13
+METATASK=australian
 STATE_NAME=ensemble_evaluations_qdo
 ISOLATE=no
 LOAD_METHOD=eage

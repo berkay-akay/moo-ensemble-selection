@@ -193,12 +193,78 @@ class MOOEnsembleProblem(Problem):
             accuracy = self.score_metric(self.labels, ensemble_pred, to_loss=False, checks=False)
             f1.append(-accuracy)  # Pymoo minimizes objective, so we negate (maximize accuracy)
 
-            # Evaluate surrogate robustness on precomputed union set
-            # adv_union_predictions: (n_models, n_union, n_classes)
-            # weights: (n_models,)
-            ensemble_adv_pred = np.tensordot(weights, self.adv_union_predictions, axes=(0, 0))  # (n_union, n_classes)
-            robustness = self.score_metric(self.adv_union_labels, ensemble_adv_pred, to_loss=False, checks=False)
-            f2.append(-robustness)  # negate (maximize robustness)
+            # --- SURROGATE ROBUSTNESS WITH DIAGNOSTICS ---
+            # 1) Clean ensemble predictions and correctness mask for THIS weight vector
+            ensemble_pred = self._ensemble_predict(self.predictions, weights)  # (N, C)
+            y_true = np.asarray(self.labels)
+            y_pred_clean = np.argmax(ensemble_pred, axis=1)
+            correct_mask = (y_pred_clean == y_true)
+            num_correct = int(correct_mask.sum())
+
+            # 2) Ensemble predictions on the adversarial union, grouped by attacker blocks
+            #    self.adv_union_predictions has shape (n_models, n_union, n_classes)
+            #    After tensordot with weights: (n_union, n_classes)
+            ensemble_adv_pred = np.tensordot(weights, self.adv_union_predictions, axes=(0, 0))
+
+            # Diagnostics before attempting reshape/grouping
+            N = int(len(y_true))
+            U = np.asarray(ensemble_adv_pred)
+            print(
+                f"[Surrogate] Start robustness eval | N={N} | num_clean_correct={num_correct} | "
+                f"adv_union_predictions.shape={getattr(self.adv_union_predictions, 'shape', None)} | "
+                f"U.shape={getattr(U, 'shape', None)}",
+                flush=True,
+            )
+
+            # 3) Robustness computation with guarded fallback and prints
+            if U.ndim != 2 or U.shape[0] == 0:
+                print(
+                    f"[Surrogate] Degenerate union tensor (U.ndim={U.ndim}, U.shape={getattr(U, 'shape', None)}). "
+                    f"Setting robust_rate=0.0",
+                    flush=True,
+                )
+                robust_rate = 0.0
+            else:
+                n_union = int(U.shape[0])
+                if N == 0 or (n_union % max(1, N)) != 0:
+                    # Fallback: cannot partition union neatly into M blocks of size N
+                    print(
+                        f"[Surrogate] Fallback to legacy scoring: N={N}, n_union={n_union}, "
+                        f"n_union % N = {None if N == 0 else (n_union % N)}",
+                        flush=True,
+                    )
+                    legacy = self.score_metric(self.adv_union_labels, U, to_loss=False, checks=False)
+                    robust_rate = float(legacy)
+                    print(
+                        f"[Surrogate] Legacy adv-accuracy over union (all points) = {robust_rate:.6f}",
+                        flush=True,
+                    )
+                else:
+                    M = n_union // N  # number of attacker-specific copies per instance
+                    print(f"[Surrogate] Using grouped evaluation with M={M} copies per instance", flush=True)
+                    U_reshaped = U.reshape(M, N, -1)  # (M, N, C)
+                    adv_pred_labels = np.argmax(U_reshaped, axis=2)  # (M, N)
+
+                    # For each instance: robust iff ALL M copies keep the true label
+                    y_true_b = np.broadcast_to(y_true, (M, N))
+                    kept_true = (adv_pred_labels == y_true_b)  # (M, N) booleans
+                    kept_true_all_m = np.all(kept_true, axis=0)  # (N,) per-instance booleans
+
+                    if num_correct == 0:
+                        robust_rate = 0.0
+                        print("[Surrogate] No clean-correct instances; robust_rate=0.0", flush=True)
+                    else:
+                        # Some helpful counts
+                        n_robust_among_correct = int(np.sum(kept_true_all_m[correct_mask]))
+                        robust_rate = float(np.mean(kept_true_all_m[correct_mask]))
+                        print(
+                            f"[Surrogate] clean-correct={num_correct} | robust_among_clean_correct={n_robust_among_correct} "
+                            f"=> robust_rate={robust_rate:.6f}",
+                            flush=True,
+                        )
+
+            # Pymoo minimizes → negate to maximize robustness
+            f2.append(-robust_rate)
 
         # Store objective values in output dictionary
         out["F"] = np.column_stack([f1, f2])
@@ -264,52 +330,83 @@ class MOOEnsembleProblem(Problem):
             classes_=self.classes_,
             feature_names=feature_names,
         )
+        # Sanity (as in your snippet): ensure sklearn-like
         assert isinstance(ensemble_model, BaseEstimator)
         assert isinstance(ensemble_model, ClassifierMixin)
 
         ensemble_model.fit()
 
-        # Enable logging
+        # Enable logging (as requested)
         logging.getLogger("art").setLevel(logging.INFO)
         logging.getLogger("art.attacks").setLevel(logging.INFO)
         logging.getLogger("art.attacks.evasion").setLevel(logging.INFO)
 
-        print("[RobustnessEval] entering _evaluate_robustness")
-        # Wrap with ART and run a black-box attack
-        pred_with_logging = PredictLogger(ensemble_model.predict_proba, max_eval=10000, name="HSJ")
+        print("[RobustnessEval] entering _evaluate_robustness", flush=True)
 
         # Use per-feature bounds / clip-values
-        X = np.asarray(self.X)
-        feat_min = X.min(axis=0)
-        feat_max = X.max(axis=0)
-        # Prevent zero-range features from causing divide-by-zero or degenerate bounds
+        X_all = np.asarray(self.X)
+        X_all = X_all.astype(np.float32, copy=False)
+        feat_min = X_all.min(axis=0)
+        feat_max = X_all.max(axis=0)
         same = feat_max <= feat_min
         feat_max[same] = feat_min[same] + 1e-8
 
+        # Compute clean predictions to get the clean-correct mask
+        proba_clean = ensemble_model.predict_proba(X_all)  # (N, C)
+        y_true = np.asarray(self.labels)
+        y_pred_clean = np.argmax(proba_clean, axis=1)
+        mask = (y_pred_clean == y_true)
+        num_correct = int(mask.sum())
+        print(
+            f"[RobustnessEval] clean-correct mask computed: num_clean_correct={num_correct} / N={len(y_true)}",
+            flush=True,
+        )
+        if num_correct == 0:
+            print("[RobustnessEval] No clean-correct instances; returning 0.0", flush=True)
+            return float(0.0)
+
+        X_sub = X_all[mask]
+        y_sub = y_true[mask]
+        print(f"[RobustnessEval] Attacking subset X_sub with shape={X_sub.shape}", flush=True)
+
+        # Wrap with ART and run a black-box attack
+        max_eval_budget = int(len(X_sub)) * 25
+        pred_with_logging = PredictLogger(ensemble_model.predict_proba, max_eval=max_eval_budget, name="HSJ")
         classifier = BlackBoxClassifier(
             pred_with_logging,
-            (X.shape[1],),
+            (X_all.shape[1],),
             len(self.classes_),
             clip_values=(feat_min.astype(np.float32), feat_max.astype(np.float32)),
         )
-        print(f"[RobustnessEval] clip_values set to per-feature arrays with shapes: "
-              f"{classifier.clip_values[0].shape}, {classifier.clip_values[1].shape}", flush=True)
-        print("[RobustnessEval] built / wrapped classifier")
-        print("[RobustnessEval] starting attack.generate | X shape:", getattr(self.X, 'shape', None), flush=True)
-        # Instantiate adversarial attack
-        attack = HopSkipJump(   # values for testing purposes
+        print(
+            f"[RobustnessEval] clip_values set to per-feature arrays with shapes: "
+            f"{classifier.clip_values[0].shape}, {classifier.clip_values[1].shape}",
+            flush=True,
+        )
+        print("[RobustnessEval] built / wrapped classifier", flush=True)
+        print("[RobustnessEval] starting attack.generate | X_sub shape: "
+              f"{getattr(X_sub, 'shape', None)}", flush=True)
+
+        # Instantiate adversarial attack (same parameters you used)
+        attack = HopSkipJump(
             classifier=classifier,
             targeted=False,  # untargeted, so no need to pass y
             max_iter=3,
             max_eval=25,
             init_eval=20,
             init_size=3,
-            verbose=True, # enable built-in logging
+            verbose=True,  # enable built-in logging
         )
-        x_test_adv = attack.generate(x=self.X)
+
+        # Generate adversarials only for clean-correct points and score conditionally
+        X_sub_adv = attack.generate(x=X_sub)
         print("[RobustnessEval] attack.generate DONE", flush=True)
-        adv_preds = classifier.predict(x_test_adv)  # shape: (n_samples, n_classes)
+        adv_preds_sub = classifier.predict(x=X_sub_adv)
 
         # Use probabilities directly to score (and not class labels)
-        adv_accuracy = self.score_metric(self.labels, adv_preds, to_loss=False, checks=False)
+        adv_accuracy = self.score_metric(y_sub, adv_preds_sub, to_loss=False, checks=False)
+        print(
+            f"[RobustnessEval] adv_accuracy on clean-correct subset = {adv_accuracy:.6f}",
+            flush=True,
+        )
         return float(adv_accuracy)

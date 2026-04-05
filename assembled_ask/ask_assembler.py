@@ -170,6 +170,28 @@ class AskAssembler:
         self._verify_collect_predictor_environment()
         ask_errors_ = {fold_idx: {"refit_and_predict_errors": {}} for fold_idx in self.folds_to_run}
 
+        # --- Write metatask schema JSON once per metatask (used to load feature names and categorical features during ensemble selection)
+        schema_path = self.tmp_output_dir.joinpath("metatask_schema.json")
+        if not schema_path.exists():
+            feature_names = list(getattr(self.metatask, "feature_names", []) or [])
+            cat_feature_names = list(getattr(self.metatask, "cat_feature_names", []) or [])
+
+            # Optional traceability fields if available on your MetaTask
+            openml_task_id = getattr(self.metatask, "openml_task_id", None)
+            dataset_name = getattr(self.metatask, "dataset_name", None)
+
+            schema = {
+                "feature_names": feature_names,
+                "cat_feature_names": cat_feature_names,
+                "openml_task_id": openml_task_id,
+                "dataset_name": dataset_name,
+            }
+            with open(schema_path, "w") as f:
+                json.dump(schema, f)
+            logger.info(f"Wrote metatask schema JSON to: {schema_path}")
+        else:
+            logger.info(f"Using existing metatask schema JSON at: {schema_path}")
+
         for iter_idx, (fold_idx, X_train, X_test, y_train, y_test) in enumerate(
                 self.metatask._exp_yield_data_for_base_model_across_folds(self.folds_to_run), 1):
             logger.info("### Processing Fold {} | {}/{} ###".format(fold_idx, iter_idx, len(self.folds_to_run)))
@@ -537,7 +559,9 @@ class AskAssembler:
         # with open(base_model_path, "wb") as f:
         #     pickle.dump(bm_model, f)
 
-        
+        # Metatask schema (used to load (categorical) feature names during ensemble selection
+        metatask_schema_path = self.tmp_output_dir.joinpath("metatask_schema.json")
+
         # Prepare predictor data
         predictor_data = {
             "bm_config": bm_config,
@@ -547,7 +571,8 @@ class AskAssembler:
             "fit_time": fit_time,
             "predict_time": predict_time,
             "model_evaluated_time": model_evaluated_time,
-            "base_model_path": str(base_model_path)  # Store path as a string !!!
+            "base_model_path": str(base_model_path),  # Store path as a string !!!
+            "metatask_path": str(metatask_schema_path)  # <-- add this
         }
 
         # Save prediction data
@@ -570,7 +595,8 @@ class AskAssembler:
             "fit_time": predictor_data["fit_time"],
             "predict_time": predictor_data["predict_time"],
             "model_evaluated_time": predictor_data["model_evaluated_time"],
-            "base_model_path": predictor_data["base_model_path"] # Include path to base models
+            "base_model_path": predictor_data["base_model_path"], # Include path to base models
+            "metatask_path": predictor_data.get("metatask_path")  # <-- add this
         }
 
         # Get Predictions

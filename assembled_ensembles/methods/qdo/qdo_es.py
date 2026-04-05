@@ -1,6 +1,7 @@
 import os
 
 import numpy as np
+import time
 
 from typing import List, Optional, Union, Callable, Dict
 
@@ -482,9 +483,9 @@ class QDOEnsembleSelection(AbstractWeightedEnsemble):
             except Exception:
                 X_for_models = X
 
-        # Compute per-feature clip values based on provided X
+        # Compute per-feature clip values based on the full X (not just the subset)
         X_arr = _np.asarray(X_for_models if not hasattr(X_for_models, 'values') else X_for_models.values)
-        X_arr = X_arr.astype(_np.float32)
+        X_arr = X_arr.astype(_np.float32, copy=False)
         feat_min = X_arr.min(axis=0)
         feat_max = X_arr.max(axis=0)
         same = feat_max <= feat_min
@@ -499,9 +500,56 @@ class QDOEnsembleSelection(AbstractWeightedEnsemble):
         )
         ensemble_model.fit()
 
-        # ART black-box wrapper with logging
-        # Align PredictLogger budget with HSJ total query budget across all samples (n_samples * 25)
-        max_eval_budget = int(X_arr.shape[0]) * 25
+        # Optional: enable ART logging (mirrors MOO‑ES)
+        import logging
+        root = logging.getLogger()
+        if not root.handlers:
+            h = logging.StreamHandler()
+            h.setLevel(logging.INFO)
+            h.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s"))
+            root.addHandler(h)
+            root.setLevel(logging.INFO)
+        for name in ("art", "art.attacks", "art.attacks.evasion"):
+            logging.getLogger(name).setLevel(logging.INFO)
+
+        print("[RobustnessEval] entering evaluate_robustness", flush=True)
+
+        # Compute clean predictions to get the clean-correct mask (on full set)
+        proba_clean = ensemble_model.predict_proba(X_arr)  # (N, C)
+        y_true = _np.asarray(y)
+        y_pred_clean = _np.argmax(proba_clean, axis=1)
+        mask = (y_pred_clean == y_true)
+        num_correct = int(mask.sum())
+        print(
+            f"[RobustnessEval] clean-correct mask computed: num_clean_correct={num_correct} / N={len(y_true)}",
+            flush=True,
+        )
+        if num_correct == 0:
+            print("[RobustnessEval] No clean-correct instances; returning 0.0", flush=True)
+            self.validation_robustness_ = 0.0
+            # Update metadata (still record the attempt)
+            if not hasattr(self, 'model_specific_metadata_') or self.model_specific_metadata_ is None:
+                self.model_specific_metadata_ = {}
+            self.model_specific_metadata_["robustness"] = dict(
+                robustness_attack="HopSkipJump",
+                attack_params=dict(max_iter=3, max_eval=25, init_eval=20, init_size=3, targeted=False),
+                n_samples=int(len(X_arr)),
+                n_clean_correct=int(num_correct),
+                n_classes=int(len(self.classes_)),
+                clip_values="per-feature",
+                weights=w.tolist(),
+                validation_robustness_=float(0.0),
+                evaluated_subset=True,
+            )
+            return float(0.0)
+
+        # Restrict to the clean-correct subset
+        X_sub = X_arr[mask]
+        y_sub = y_true[mask]
+        print(f"[RobustnessEval] Attacking subset X_sub with shape={X_sub.shape}", flush=True)
+
+        # ART black-box wrapper with logging; align PredictLogger budget with attacked samples
+        max_eval_budget = int(len(X_sub)) * 25
         pred_with_logging = PredictLogger(ensemble_model.predict_proba, max_eval=max_eval_budget, name="HSJ")
         classifier = BlackBoxClassifier(
             pred_with_logging,
@@ -509,34 +557,51 @@ class QDOEnsembleSelection(AbstractWeightedEnsemble):
             len(self.classes_),
             clip_values=(feat_min.astype(_np.float32), feat_max.astype(_np.float32)),
         )
+        print(
+            f"[RobustnessEval] clip_values set to per-feature arrays with shapes: "
+            f"{classifier.clip_values[0].shape}, {classifier.clip_values[1].shape}",
+            flush=True,
+        )
+        print("[RobustnessEval] built / wrapped classifier", flush=True)
+        print("[RobustnessEval] starting attack.generate | X_sub shape: "
+              f"{getattr(X_sub, 'shape', None)}", flush=True)
 
+        # Instantiate adversarial attack (same parameters as in MOO‑ES)
         attack = HopSkipJump(
             classifier=classifier,
-            targeted=False,
+            targeted=False,  # untargeted, so no need to pass y
             max_iter=3,
             max_eval=25,
             init_eval=20,
             init_size=3,
-            verbose=True,
+            verbose=True,  # enable built-in logging
         )
-        # Always pass a float32 NumPy array to ART
-        X_adv = attack.generate(x=X_arr)
-        adv_preds = classifier.predict(x=X_adv)
 
-        adv_accuracy = self.score_metric(y, adv_preds, to_loss=False, checks=False)
+        # Generate adversarials only for clean-correct points and score conditionally
+        X_sub_adv = attack.generate(x=X_sub)
+        print("[RobustnessEval] attack.generate DONE", flush=True)
+        adv_preds_sub = classifier.predict(x=X_sub_adv)
+
+        # Use probabilities directly to score (and not class labels)
+        adv_accuracy = self.score_metric(y_sub, adv_preds_sub, to_loss=False, checks=False)
+        print(
+            f"[RobustnessEval] adv_accuracy on clean-correct subset = {adv_accuracy:.6f}",
+            flush=True,
+        )
         self.validation_robustness_ = float(adv_accuracy)
 
-        # Update metadata
+        # Update metadata (do not overwrite existing top-level keys)
         robustness_meta = dict(
             robustness_attack="HopSkipJump",
             attack_params=dict(max_iter=3, max_eval=25, init_eval=20, init_size=3, targeted=False),
             n_samples=int(len(X_arr)),
+            n_clean_correct=int(num_correct),
             n_classes=int(len(self.classes_)),
             clip_values="per-feature",
             weights=w.tolist(),
             validation_robustness_=float(adv_accuracy),
+            evaluated_subset=True,
         )
-        # Do not overwrite existing metadata; extend it
         if not hasattr(self, 'model_specific_metadata_') or self.model_specific_metadata_ is None:
             self.model_specific_metadata_ = {}
         self.model_specific_metadata_["robustness"] = robustness_meta
@@ -547,12 +612,36 @@ class QDOEnsembleSelection(AbstractWeightedEnsemble):
         """Passthrough fit for QDO: keep original optimization on cached predictions,
         then load actual base models and run post-hoc robustness evaluation.
         """
+        if not hasattr(self, 'model_specific_metadata_') or self.model_specific_metadata_ is None:
+            self.model_specific_metadata_ = {}
+
+        _t0_total = time.perf_counter()
+
         # Step 1: run original optimizer using cached predictions
+        _t0_opt = time.perf_counter()
         self.ensemble_fit(base_model_predictions, labels)
+        _t1_opt = time.perf_counter()
+
         # Step 2: load real base models
+        _t0_load = time.perf_counter()
         self._load_actual_base_models()
+        _t1_load = time.perf_counter()
+
         # Step 3: evaluate robustness on raw features
+        _t0_rob = time.perf_counter()
         self.evaluate_robustness(X, labels)
+        _t1_rob = time.perf_counter()
+
+        _t1_total = time.perf_counter()
+
+        # Store timings
+        self.model_specific_metadata_.update(dict(
+            wallclock_total_sec=float(_t1_total - _t0_total),
+            wallclock_optimization_sec=float(_t1_opt - _t0_opt),
+            wallclock_load_models_sec=float(_t1_load - _t0_load),
+            wallclock_robustness_sec=float(_t1_rob - _t0_rob),
+        ))
+
         return self
 
     def ensemble_passthrough_predict_proba(self, X, bm_preds):
