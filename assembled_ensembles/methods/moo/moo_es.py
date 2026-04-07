@@ -4,15 +4,13 @@ from assembled_ensembles.wrapper.abstract_ensemble import AbstractEnsemble
 import numpy as np
 # Needs to be done for bugfixing (because we had to downgrade NumPy)
 import warnings as _pywarnings
-
 if not hasattr(np, "warnings"):
     np.warnings = _pywarnings
 
 from typing import List, Optional, Callable, Union
 from assembled_ensembles.wrapper.abstract_weighted_ensemble import \
     AbstractWeightedEnsemble
-from assembled_ensembles.methods.moo.moo_ensemble_problem import MOOEnsembleProblem, EnsembleSklearnWrapper, \
-    PredictLogger
+from assembled_ensembles.methods.moo.moo_ensemble_problem import MOOEnsembleProblem, EnsembleSklearnWrapper, PredictLogger
 from assembled_ensembles.util.metrics import AbstractMetric
 from sklearn.utils import check_random_state
 import pickle
@@ -22,7 +20,6 @@ from pymoo.factory import get_algorithm
 from pymoo.optimize import minimize
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 import time
-
 # Optional: Hypervolume performance indicator (guarded by try/except for compatibility)
 try:
     from pymoo.performance_indicator.hv import Hypervolume as _HV
@@ -35,6 +32,7 @@ from art.estimators.classification import SklearnClassifier
 from assembled_ask.util.metatask_base import get_metatask
 from art.estimators.classification import BlackBoxClassifier
 from art.attacks.evasion import HopSkipJump
+
 
 
 def _get_val_data_from_metatask(mt,
@@ -162,20 +160,52 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         """
         _t0_total = time.perf_counter()
 
-        # --- EARLY EXIT IF DATASET HAS CATEGORICAL FEATURES --------------------
-        model_metadata = getattr(self.base_models[0], "model_metadata")
-        metatask_path = (model_metadata.get("metatask_json_path")
-                         or model_metadata.get("metatask_path"))
-        mt = get_metatask(metatask_path)
-        cat_names = getattr(mt, "cat_feature_names")
-        if isinstance(cat_names, (list, tuple)) and len(cat_names) > 0:
-            print("[MOO-ES] Detected categorical input features. "
-                  "Datasets with categorical features are not supported yet. Aborting.", flush=True)
-            # Record early exit in model_specific_metadata_
-            self.model_specific_metadata_['aborted_reason'] = 'categorical_features_unsupported'
-            self.model_specific_metadata_['cat_feature_names'] = list(cat_names)
-            return self
-        # -----------------------------------------------------------------------
+        # --- EARLY EXIT IF DATASET HAS CATEGORICAL FEATURES (via metatask_schema.json) ---
+        import json
+
+        md0 = getattr(self.base_models[0], "model_metadata", None)
+        if not isinstance(md0, dict):
+            raise ValueError("Base model[0] lacks 'model_metadata' dict; cannot locate metatask_schema.json")
+
+        # Prefer values directly from metadata if present
+        dataset_name = md0.get("dataset_name")
+        openml_task_id = md0.get("openml_task_id")
+
+        # Fallback: parse the metatask JSON (input-side) to extract them – do NOT call get_metatask here
+        if dataset_name is None or openml_task_id is None:
+            mt_path = md0.get("metatask_json_path") or md0.get("metatask_path")
+            if not mt_path:
+                raise ValueError("Missing dataset_name/openml_task_id in metadata and no metatask path to infer them")
+            with open(mt_path, "r", encoding="utf-8") as f:
+                mt_json = json.load(f)
+            dataset_name = dataset_name or mt_json.get("dataset_name")
+            openml_task_id = openml_task_id or mt_json.get("openml_task_id")
+            if dataset_name is None or openml_task_id is None:
+                raise ValueError("Could not infer dataset_name/openml_task_id from metatask JSON")
+
+        # Build the canonical path to the schema file in benchmark/output
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        schema_path = os.path.join(
+            repo_root,
+            "benchmark", "output", str(dataset_name), f"task_{int(openml_task_id)}",
+            "metatask_schema.json",
+        )
+        if not os.path.isfile(schema_path):
+            raise FileNotFoundError(f"metatask_schema.json not found at: {schema_path}")
+
+        with open(schema_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+
+        cat_feature_names = schema.get("cat_feature_names") or []
+        if len(cat_feature_names) > 0:
+            self.model_specific_metadata_.setdefault('aborted_reason', 'categorical_features_unsupported')
+            self.model_specific_metadata_['cat_feature_names'] = list(cat_feature_names)
+            # Raise to abort the fold cleanly; the caller should catch and skip scoring
+            raise RuntimeError("Datasets with categorical input features are not supported yet for MOO-ES")
+        # -------------------------------------------------------------------------------
+
+
+
 
         # Number of base models
         n_base_models = len(self.base_models)
@@ -228,8 +258,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             if getattr(self, 'base_models_metadata_exists', False) and hasattr(self, 'base_models_metadata_'):
                 meta0 = self.base_models_metadata_[0] if len(self.base_models_metadata_) > 0 else None
                 if isinstance(meta0, dict):
-                    feature_names_for_attack = meta0.get('feature_names') or meta0.get('columns') or meta0.get(
-                        'feature_names_in_')
+                    feature_names_for_attack = meta0.get('feature_names') or meta0.get('columns') or meta0.get('feature_names_in_')
         except Exception:
             feature_names_for_attack = None
 
@@ -242,7 +271,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
                 X_attack_in = X
 
         perturbed_sets = []  # list to store perturbed validation sets
-        origin_idx = []  # origin model index (needed to use ensemble weightening during optimization)
+        origin_idx = []      # origin model index (needed to use ensemble weightening during optimization)
 
         # Use per-feature bounds / clip-values
         X_np = np.asarray(X, dtype=np.float32)
@@ -368,8 +397,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
                 print(f"[MOO-ES] Caching predict_proba on U for base model {j}", flush=True)
                 adv_union_predictions.append(bm.predict_proba(U_for_models))
             adv_union_predictions = np.asarray(adv_union_predictions)
-        print(f"[MOO-ES] Cached adv_union_predictions with shape {getattr(adv_union_predictions, 'shape', None)}",
-              flush=True)
+        print(f"[MOO-ES] Cached adv_union_predictions with shape {getattr(adv_union_predictions, 'shape', None)}", flush=True)
         _t1_pool = time.perf_counter()
 
         # --------------------- Build problem ---------------------
@@ -383,8 +411,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             random_state=self.random_state,
             n_jobs=self.n_jobs,
             classes_=self.classes_,
-            base_models_metadata=(
-                self.base_models_metadata_ if getattr(self, 'base_models_metadata_exists', False) else None),
+            base_models_metadata=(self.base_models_metadata_ if getattr(self, 'base_models_metadata_exists', False) else None),
             adv_union_predictions=adv_union_predictions,
             adv_union_labels=U_labels,
         )
@@ -494,8 +521,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
                     gen=gen,
                     pop_size=int(F.shape[0]),
                     acc_min=float(np.nanmin(acc)), acc_mean=float(np.nanmean(acc)), acc_max=float(np.nanmax(acc)),
-                    rob_min=float(np.nanmin(rob_surr)), rob_mean=float(np.nanmean(rob_surr)),
-                    rob_max=float(np.nanmax(rob_surr)),
+                    rob_min=float(np.nanmin(rob_surr)), rob_mean=float(np.nanmean(rob_surr)), rob_max=float(np.nanmax(rob_surr)),
                     n_nondominated=n_nondom,
                     t_sec=float(time.perf_counter() - _run_start),
                     # New guarded fields
@@ -534,8 +560,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
 
         print(f"[MOO-ES] Number of Pareto-optimal ensembles: {len(pareto_weights)}", flush=True)
         for i, (a, r) in enumerate(zip(pareto_acc, pareto_robust_surr)):
-            print(f"[MOO-ES] Pareto-optimal ensemble (surrogate) idx={i} | accuracy={a:.6f} | adv_acc_surr={r:.6f}",
-                  flush=True)
+            print(f"[MOO-ES] Pareto-optimal ensemble (surrogate) idx={i} | accuracy={a:.6f} | adv_acc_surr={r:.6f}", flush=True)
 
         print("[MOO-ES] Re-attacking Pareto-optimal ensembles to compute true robustness", flush=True)
         _t0_reattack = time.perf_counter()
@@ -585,8 +610,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         final_hypervolume = None
         try:
             pareto_F = np.atleast_2d(res.F)
-            final_pareto_front_size = int(
-                len(NonDominatedSorting(method="fast_non_dominated_sort").do(pareto_F, only_non_dominated_front=True)))
+            final_pareto_front_size = int(len(NonDominatedSorting(method="fast_non_dominated_sort").do(pareto_F, only_non_dominated_front=True)))
         except Exception:
             pass
         try:
@@ -614,8 +638,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             pareto_true_robustness=[None if np.isnan(v) else float(v) for v in pareto_robust_true.tolist()],
             selected_index=int(best_index),
             selected_accuracy=float(pareto_acc[best_index]),
-            selected_robustness_true=None if np.isnan(pareto_robust_true[best_index]) else float(
-                pareto_robust_true[best_index]),
+            selected_robustness_true=None if np.isnan(pareto_robust_true[best_index]) else float(pareto_robust_true[best_index]),
             # End-of-run diagnostics
             final_pareto_front_size=final_pareto_front_size,
             final_hypervolume=final_hypervolume,

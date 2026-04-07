@@ -80,6 +80,35 @@ class AskAssembler:
         self.ask_model_choices = 16
         self.config_key_for_model_type = "classifier:__choice__"
 
+    def _prune_non_selected_predictors(self, fold_idx, keep_ids):
+        """Delete prediction_data and base_models that are not in keep_ids / not in the final ensemble for a given fold."""
+        base_dir = self.tmp_output_dir.joinpath(f"fold_{fold_idx}")
+        assembler_dir = base_dir.joinpath(".ask_assembler")
+        pred_dir = assembler_dir.joinpath("prediction_data")
+        model_dir = assembler_dir.joinpath("base_models")
+
+        keep = set(str(k) for k in keep_ids)
+
+        # 1) Prune prediction_data
+        if pred_dir.exists():
+            for p in glob.glob(str(pred_dir.joinpath("model_*.pkl"))):
+                ask_id = os.path.basename(p).split("_")[1].split(".")[0]
+                if ask_id not in keep:
+                    try:
+                        os.remove(p)
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(f"Could not remove {p}: {e}")
+
+        # 2) Prune base_models
+        if model_dir.exists():
+            for p in glob.glob(str(model_dir.joinpath("model_*.pkl"))):
+                ask_id = os.path.basename(p).split("_")[1].split(".")[0]
+                if ask_id not in keep:
+                    try:
+                        os.remove(p)
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(f"Could not remove {p}: {e}")
+
     def get_resampling_strategy(self, X_train, y_train):
         """Get the resampling strategy appropriate for our framework and auto-sklearn."""
 
@@ -130,7 +159,7 @@ class AskAssembler:
                                                                       delete_tmp_folder_after_terminate=False,
                                                                       ensemble_size=0,
                                                                       max_models_on_disc=max_models_on_disc,
-                                                                      load_models=True, # TODO: Was False before
+                                                                      load_models=True,  # TODO: Was False before
                                                                       resampling_strategy=resampling_strategy
                                                                       )
             logger.info("Start Search")
@@ -284,12 +313,11 @@ class AskAssembler:
 
                 # -- Store Base Model
                 base_model_dir = base_dir.joinpath(".ask_assembler/base_models")
-                
+
                 base_model_dir.mkdir(parents=True, exist_ok=True)
                 base_model_path = base_model_dir.joinpath("model_{}.pkl".format(ask_run_id))
                 with open(base_model_path, "wb") as f:
                     pickle.dump(bm_model, f)
-
 
             # -- Store fold errors
             logger.info("Found the following Errors with Auto-sklearn: {}".format(ask_errors_[fold_idx]))
@@ -348,6 +376,10 @@ class AskAssembler:
 
                 logger.info("Removed {} predictors due to Pruner Settings for fold {}".format(
                     n_all - len(ask_ids_to_keep), f))
+
+            # NEW: prune files on disk to only keep TopN/SiloTopN
+            for f, ask_ids_to_keep in to_load_predictors_per_fold.items():
+                self._prune_non_selected_predictors(f, ask_ids_to_keep)
         else:
             # --- Get all IDs that exist
             logger.info("Get all Ask Run IDs from Disc.")
@@ -546,14 +578,13 @@ class AskAssembler:
         store_dir = self.tmp_output_dir.joinpath("fold_{}/.ask_assembler".format(fold_idx))
         predictor_dir = store_dir.joinpath("prediction_data")
         base_model_dir = store_dir.joinpath("base_models")
-        
+
         # Ensure directories exist
-        predictor_dir.mkdir(parents=True, exist_ok=True) # Directory for prediction data
+        predictor_dir.mkdir(parents=True, exist_ok=True)  # Directory for prediction data
         logger.info("Prediction data directory created")
         # base_model_dir.mkdir(parents=True, exist_ok=True) # Directory for actual base models
         # logger.info("Base model directory created")
 
-        
         # Save base model
         base_model_path = base_model_dir.joinpath("model_{}.pkl".format(ask_run_id))
         # with open(base_model_path, "wb") as f:
@@ -572,7 +603,7 @@ class AskAssembler:
             "predict_time": predict_time,
             "model_evaluated_time": model_evaluated_time,
             "base_model_path": str(base_model_path),  # Store path as a string !!!
-            "metatask_path": str(metatask_schema_path)  # <-- add this
+            "metatask_path": str(metatask_schema_path)
         }
 
         # Save prediction data
@@ -595,7 +626,7 @@ class AskAssembler:
             "fit_time": predictor_data["fit_time"],
             "predict_time": predictor_data["predict_time"],
             "model_evaluated_time": predictor_data["model_evaluated_time"],
-            "base_model_path": predictor_data["base_model_path"], # Include path to base models
+            "base_model_path": predictor_data["base_model_path"],  # Include path to base models
             "metatask_path": predictor_data.get("metatask_path")  # <-- add this
         }
 
