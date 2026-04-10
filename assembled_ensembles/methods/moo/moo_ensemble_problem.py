@@ -83,7 +83,7 @@ class EnsembleSklearnWrapper(BaseEstimator, ClassifierMixin):
         if not np.isclose(w.sum(), 1.0):
             w = w / (w.sum() + 1e-12)
         avg = np.tensordot(w, probs, axes=(0, 0))  # (n_samples, n_classes)
-        # keep it a valid probability simplex
+
         avg = np.clip(avg, 0.0, 1.0)
         s = avg.sum(axis=1, keepdims=True)
         s[s == 0.0] = 1.0
@@ -158,9 +158,8 @@ class MOOEnsembleProblem(Problem):
         self.n_jobs = n_jobs
         self.classes_ = classes_
         self.base_models_metadata = base_models_metadata
-        # Cached adversarial predictions/labels for surrogate robustness (optional)
-        self.adv_union_predictions = adv_union_predictions  # (n_models, n_union, n_classes) or None
-        self.adv_union_labels = adv_union_labels            # (n_union,) or None
+        self.adv_union_predictions = adv_union_predictions
+        self.adv_union_labels = adv_union_labels
         if self.adv_union_predictions is not None:
             print(f"[MOOProblem] Using surrogate robustness on union set with shape: "
                   f"{getattr(self.adv_union_predictions, 'shape', None)}", flush=True)
@@ -168,7 +167,7 @@ class MOOEnsembleProblem(Problem):
 
     def _evaluate(self, x, out, *args, **kwargs):
         """
-        Evaluate accuracy/robustness for a batch of ensembles/weight vectors.
+        Evaluate accuracy and robustness (through a surrogate) for a batch/generation of ensembles/weight vectors.
 
         Parameters
         ----------
@@ -181,42 +180,36 @@ class MOOEnsembleProblem(Problem):
         f1 = []  # List for accuracy
         f2 = []  # List for robustness
 
-        # Iterate over weight vectors in population/batch
+        # Iterate over weight vectors in NSGA-II population
         for weights in x:
             # Normalize weights
             weights = weights / np.sum(weights)
 
-            # Aggregate ensemble predictions using weights (CLEAN accuracy)
+            # Aggregate ensemble predictions using weights (predictions on the clean validation set)
             ensemble_pred = self._ensemble_predict(self.predictions, weights)
 
-            # Evaluate accuracy
+            # Evaluate clean accuracy
             accuracy = self.score_metric(self.labels, ensemble_pred, to_loss=False, checks=False)
-            f1.append(-accuracy)  # Pymoo minimizes objective, so we negate (maximize accuracy)
+            f1.append(-accuracy)  # Pymoo minimizes objective, so we negate to maximize accuracy
 
-            # --- SURROGATE ROBUSTNESS WITH DIAGNOSTICS ---
-            # 1) Clean ensemble predictions and correctness mask for THIS weight vector
+            # --- ADVERSARIAL ROBUSTNESS SURROGATE ---
+            # Identify clean-correct instances in the ensemble
             ensemble_pred = self._ensemble_predict(self.predictions, weights)  # (N, C)
             y_true = np.asarray(self.labels)
             y_pred_clean = np.argmax(ensemble_pred, axis=1)
             correct_mask = (y_pred_clean == y_true)
             num_correct = int(correct_mask.sum())
 
-            # 2) Ensemble predictions on the adversarial union, grouped by attacker blocks
-            #    self.adv_union_predictions has shape (n_models, n_union, n_classes)
-            #    After tensordot with weights: (n_union, n_classes)
+            # Compute ensemble predictions on the adversarial union
+            #   - Adversarial Union = union of all adversarial copies for each instance based on each base model
             ensemble_adv_pred = np.tensordot(weights, self.adv_union_predictions, axes=(0, 0))
 
-            # Diagnostics before attempting reshape/grouping
-            N = int(len(y_true))
-            U = np.asarray(ensemble_adv_pred)
-            print(
-                f"[Surrogate] Start robustness eval | N={N} | num_clean_correct={num_correct} | "
-                f"adv_union_predictions.shape={getattr(self.adv_union_predictions, 'shape', None)} | "
-                f"U.shape={getattr(U, 'shape', None)}",
-                flush=True,
-            )
 
-            # 3) Robustness computation with guarded fallback and prints
+            N = int(len(y_true)) # Number of original validation instances
+            U = np.asarray(ensemble_adv_pred) # Candidate ensemble's predictions on the adversarial union set
+
+
+            # Check if U is in the correct shape
             if U.ndim != 2 or U.shape[0] == 0:
                 print(
                     f"[Surrogate] Degenerate union tensor (U.ndim={U.ndim}, U.shape={getattr(U, 'shape', None)}). "
@@ -225,45 +218,53 @@ class MOOEnsembleProblem(Problem):
                 )
                 robust_rate = 0.0
             else:
-                n_union = int(U.shape[0])
-                if N == 0 or (n_union % max(1, N)) != 0:
-                    # Fallback: cannot partition union neatly into M blocks of size N
+                n_union = int(U.shape[0]) # Compute total number of adversarial copies in the union
+                if N == 0 or (n_union % max(1, N)) != 0: # Check correct structure of U (n_union = Number of base models * Number of validation instances)
+                    # If structure incorrect, fallback to using the adversarial accuracy over all union points at once (alternative surrogate)
                     print(
-                        f"[Surrogate] Fallback to legacy scoring: N={N}, n_union={n_union}, "
+                        f"[Surrogate] Degenerate U shape (N={N}, n_union={n_union}) "
+                        f"[Surrogate] Fallback to scoring over all adversarial union points at once: N={N}, n_union={n_union}, "
                         f"n_union % N = {None if N == 0 else (n_union % N)}",
                         flush=True,
                     )
                     legacy = self.score_metric(self.adv_union_labels, U, to_loss=False, checks=False)
                     robust_rate = float(legacy)
                     print(
-                        f"[Surrogate] Legacy adv-accuracy over union (all points) = {robust_rate:.6f}",
+                        f"[Surrogate] Adv-accuracy over union (all points) = {robust_rate:.6f}",
                         flush=True,
                     )
                 else:
-                    M = n_union // N  # number of attacker-specific copies per instance
-                    print(f"[Surrogate] Using grouped evaluation with M={M} copies per instance", flush=True)
+                    M = n_union // N  # number of attacker blocks
                     U_reshaped = U.reshape(M, N, -1)  # (M, N, C)
-                    adv_pred_labels = np.argmax(U_reshaped, axis=2)  # (M, N)
+                    adv_pred_labels = np.argmax(U_reshaped, axis=2)  # (M, N), convert probabilities to class labels
 
-                    # For each instance: robust iff ALL M copies keep the true label
-                    y_true_b = np.broadcast_to(y_true, (M, N))
-                    kept_true = (adv_pred_labels == y_true_b)  # (M, N) booleans
-                    kept_true_all_m = np.all(kept_true, axis=0)  # (N,) per-instance booleans
+                    # Survival indicator per attacker block and instance:
+                    # kept_true[m, i] = 1 if attacked copy from block m keeps the true label for instance i
+                    y_true_b = np.broadcast_to(y_true, (M, N)) # Copy true labels to all attacker blocks
+                    kept_true = (adv_pred_labels == y_true_b).astype(float)
 
-                    if num_correct == 0:
+                    if num_correct == 0: # If ensemble gets no clean instance correct
                         robust_rate = 0.0
                         print("[Surrogate] No clean-correct instances; robust_rate=0.0", flush=True)
                     else:
-                        # Some helpful counts
-                        n_robust_among_correct = int(np.sum(kept_true_all_m[correct_mask]))
-                        robust_rate = float(np.mean(kept_true_all_m[correct_mask]))
-                        print(
-                            f"[Surrogate] clean-correct={num_correct} | robust_among_clean_correct={n_robust_among_correct} "
-                            f"=> robust_rate={robust_rate:.6f}",
-                            flush=True,
+                        # Weight attacker blocks by the current candidate ensemble weights (block 1 gets weight of bm 1 etc.)
+                        attacker_weights = np.asarray(weights, dtype=float)
+                        if attacker_weights.sum() <= 0:
+                            attacker_weights = np.ones_like(attacker_weights) / len(attacker_weights)
+                        else:
+                            attacker_weights = attacker_weights / attacker_weights.sum()
+
+                        # For each instance, compute weighted average "survival" across blocks / all adversarial copies
+                        per_instance_survival = np.average(
+                            kept_true,
+                            axis=0,
+                            weights=attacker_weights
                         )
 
-            # Pymoo minimizes → negate to maximize robustness
+                        # Final surrogate robustness = average per-instance survival (over the ensemble-clean-correct instances only)
+                        robust_rate = float(np.mean(per_instance_survival[correct_mask]))
+
+            # Pymoo minimizes -> negate to maximize robustness
             f2.append(-robust_rate)
 
         # Store objective values in output dictionary
@@ -330,13 +331,12 @@ class MOOEnsembleProblem(Problem):
             classes_=self.classes_,
             feature_names=feature_names,
         )
-        # Sanity (as in your snippet): ensure sklearn-like
         assert isinstance(ensemble_model, BaseEstimator)
         assert isinstance(ensemble_model, ClassifierMixin)
 
         ensemble_model.fit()
 
-        # Enable logging (as requested)
+        # Enable logging
         logging.getLogger("art").setLevel(logging.INFO)
         logging.getLogger("art.attacks").setLevel(logging.INFO)
         logging.getLogger("art.attacks.evasion").setLevel(logging.INFO)
@@ -387,10 +387,10 @@ class MOOEnsembleProblem(Problem):
         print("[RobustnessEval] starting attack.generate | X_sub shape: "
               f"{getattr(X_sub, 'shape', None)}", flush=True)
 
-        # Instantiate adversarial attack (same parameters you used)
+        # Instantiate adversarial attack
         attack = HopSkipJump(
             classifier=classifier,
-            targeted=False,  # untargeted, so no need to pass y
+            targeted=False,  # untargeted
             max_iter=3,
             max_eval=25,
             init_eval=20,

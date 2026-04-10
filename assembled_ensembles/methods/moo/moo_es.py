@@ -20,19 +20,91 @@ from pymoo.factory import get_algorithm
 from pymoo.optimize import minimize
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 import time
-# Optional: Hypervolume performance indicator (guarded by try/except for compatibility)
+import multiprocessing as mp
+
 try:
     from pymoo.performance_indicator.hv import Hypervolume as _HV
 except Exception:  # older/newer pymoo or missing module
     _HV = None
 
 # ART Imports for adversarial robustness evaluation
-from art.attacks.evasion import BoundaryAttack
 from art.estimators.classification import SklearnClassifier
 from assembled_ask.util.metatask_base import get_metatask
 from art.estimators.classification import BlackBoxClassifier
 from art.attacks.evasion import HopSkipJump
 
+def _hsj_single_instance_worker(x_i, wrapper, feat_min, feat_max, n_classes, hsj_max_eval, out_queue):
+    """
+    Run HSJ for a single instance inside a separate process.
+    Writes either ("ok", x_adv_i) or ("err", repr(exception)) to out_queue.
+    """
+    try:
+        pred_with_logging = PredictLogger(
+            wrapper.predict_proba,
+            max_eval=hsj_max_eval,
+            name="HSJ_single"
+        )
+
+        clf = BlackBoxClassifier(
+            pred_with_logging,
+            input_shape=(x_i.shape[1],),
+            nb_classes=n_classes,
+            clip_values=(feat_min, feat_max),
+        )
+
+        attack = HopSkipJump(
+            classifier=clf,
+            targeted=False,
+            max_iter=3,
+            max_eval=hsj_max_eval,
+            init_eval=20,
+            init_size=3,
+            verbose=False,
+        )
+
+        x_adv_i = attack.generate(x=x_i)
+        out_queue.put(("ok", np.asarray(x_adv_i, dtype=np.float32)))
+    except Exception as e:
+        out_queue.put(("err", repr(e)))
+
+
+def _run_hsj_single_instance_with_timeout(x_i, wrapper, feat_min, feat_max, n_classes, hsj_max_eval, timeout_sec=1.0):
+    """
+    Run HSJ on a single instance with a hard timeout.
+    Returns (x_adv_i, reason), where:
+      - x_adv_i is np.ndarray of shape (1, d) on success, else None
+      - reason is None on success, else a short string such as 'timeout'
+    """
+    try:
+        ctx = mp.get_context("fork")
+    except ValueError:
+        ctx = mp.get_context()
+
+    out_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_hsj_single_instance_worker,
+        args=(x_i, wrapper, feat_min, feat_max, n_classes, hsj_max_eval, out_queue),
+    )
+
+    proc.start()
+    proc.join(timeout_sec)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        try:
+            out_queue.close()
+        except Exception:
+            pass
+        return None, "timeout"
+
+    if not out_queue.empty():
+        status, payload = out_queue.get()
+        if status == "ok":
+            return payload, None
+        return None, payload
+
+    return None, "no_result"
 
 
 def _get_val_data_from_metatask(mt,
@@ -167,11 +239,11 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         if not isinstance(md0, dict):
             raise ValueError("Base model[0] lacks 'model_metadata' dict; cannot locate metatask_schema.json")
 
-        # Prefer values directly from metadata if present
+        # Prefer values directly from metadata (if present)
         dataset_name = md0.get("dataset_name")
         openml_task_id = md0.get("openml_task_id")
 
-        # Fallback: parse the metatask JSON (input-side) to extract them – do NOT call get_metatask here
+        # Fallback: parse the metatask JSON
         if dataset_name is None or openml_task_id is None:
             mt_path = md0.get("metatask_json_path") or md0.get("metatask_path")
             if not mt_path:
@@ -200,7 +272,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         if len(cat_feature_names) > 0:
             self.model_specific_metadata_.setdefault('aborted_reason', 'categorical_features_unsupported')
             self.model_specific_metadata_['cat_feature_names'] = list(cat_feature_names)
-            # Raise to abort the fold cleanly; the caller should catch and skip scoring
+            # Raise to abort the fold cleanly -> Skip scoring
             raise RuntimeError("Datasets with categorical input features are not supported yet for MOO-ES")
         # -------------------------------------------------------------------------------
 
@@ -294,8 +366,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             ).fit()
 
             # ------------------------------------------------------------
-            # Step 1: determine which validation instances are clean-correct
-            # for THIS base model
+            # Step 1: determine which validation instances are clean-correct for this base model
             # ------------------------------------------------------------
             clean_proba = wrapper.predict_proba(X_attack_in)  # shape (N, C)
             clean_pred = np.argmax(clean_proba, axis=1)
@@ -326,40 +397,55 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             # Attack only the clean-correct subset
             X_sub = X_np[clean_mask]
 
-            pred_with_logging = PredictLogger(
-                wrapper.predict_proba,
-                max_eval=X_sub.shape[0] * HSJ_MAX_EVAL,
-                name=f"HSJ_bm{m_idx}"
-            )
-
-            clf = BlackBoxClassifier(
-                pred_with_logging,
-                input_shape=(X_np.shape[1],),
-                nb_classes=len(self.classes_),
-                clip_values=(feat_min, feat_max),
-            )
-
-            attack = HopSkipJump(
-                classifier=clf,
-                targeted=False,
-                max_iter=3,
-                max_eval=HSJ_MAX_EVAL,
-                init_eval=20,
-                init_size=3,
-                verbose=True
-            )
-
             print(
                 f"[MOO-ES] Base model {m_idx}: attacking only clean-correct subset "
-                f"with shape={X_sub.shape}",
+                f"with shape={X_sub.shape} using per-instance HSJ (5s timeout)",
                 flush=True,
             )
 
-            x_adv_sub = attack.generate(x=X_sub)
+            clean_indices = np.where(clean_mask)[0]
+            n_timeout = 0
+            n_failed = 0
+            n_success = 0
 
-            # Insert adversarial examples only for clean-correct rows.
-            # Clean-wrong rows remain the original clean instances.
-            x_adv_full[clean_mask] = x_adv_sub
+            for orig_idx in clean_indices:
+                x_i = X_np[orig_idx:orig_idx + 1]
+
+                x_adv_i, fail_reason = _run_hsj_single_instance_with_timeout(
+                    x_i=x_i,
+                    wrapper=wrapper,
+                    feat_min=feat_min,
+                    feat_max=feat_max,
+                    n_classes=len(self.classes_),
+                    hsj_max_eval=HSJ_MAX_EVAL,
+                    timeout_sec=1.0,
+                )
+
+                if x_adv_i is None:
+                    if fail_reason == "timeout":
+                        n_timeout += 1
+                        print(
+                            f"[MOO-ES] Base model {m_idx}: HSJ timeout on instance {orig_idx}; "
+                            f"keeping clean fallback.",
+                            flush=True,
+                        )
+                    else:
+                        n_failed += 1
+                        print(
+                            f"[MOO-ES] Base model {m_idx}: HSJ failed on instance {orig_idx} "
+                            f"with reason={fail_reason}; keeping clean fallback.",
+                            flush=True,
+                        )
+                    continue
+
+                x_adv_full[orig_idx] = x_adv_i[0]
+                n_success += 1
+
+            print(
+                f"[MOO-ES] Base model {m_idx}: per-instance HSJ finished | "
+                f"success={n_success}, timeout={n_timeout}, failed={n_failed}",
+                flush=True,
+            )
 
             perturbed_sets.append(x_adv_full)
             origin_idx.append(np.full(x_adv_full.shape[0], m_idx, dtype=int))
@@ -385,7 +471,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         if U.shape[0] == 0:
             adv_union_predictions = np.zeros((len(actual_base_models), 0, len(self.classes_)), dtype=float)
         else:
-            adv_union_predictions = []  # will become (n_models, n_union, n_classes)
+            adv_union_predictions = []
             U_for_models = U
             if feature_names_for_attack is not None:
                 try:
@@ -400,7 +486,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         print(f"[MOO-ES] Cached adv_union_predictions with shape {getattr(adv_union_predictions, 'shape', None)}", flush=True)
         _t1_pool = time.perf_counter()
 
-        # --------------------- Build problem ---------------------
+        # Build problem
         problem = MOOEnsembleProblem(
             n_base_models=n_base_models,
             predictions=base_models_predictions,
@@ -416,8 +502,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             adv_union_labels=U_labels,
         )
 
-        # Configure algorithm
-        algorithm = get_algorithm("nsga2", pop_size=self.population_size)
+        algorithm = get_algorithm("nsga2", pop_size=self.population_size, eliminate_duplicates=True)
 
         # --------------------- Optimization with per-generation callback (timed) ---------------------
         self.model_specific_metadata_.setdefault('per_generation_stats', [])
@@ -426,8 +511,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
 
         nds = NonDominatedSorting(method="fast_non_dominated_sort")
 
-        # Telemetry helpers for optimization dynamics
-        _hv_ref = None  # lazily determined reference point for hypervolume
+        _hv_ref = None
 
         def _unique_ratio(X, tol: float = 1e-12):
             try:
@@ -451,7 +535,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             except Exception:
                 return None
 
-        def _per_gen_callback(algorithm):
+        def _per_gen_callback(algorithm): # Helper method to capture/store per-generation stats
             nonlocal _hv_ref
             try:
                 gen = int(getattr(algorithm, 'n_gen', 0))
@@ -605,7 +689,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         # Timing aggregation
         _t1_total = time.perf_counter()
 
-        # End-of-run optimization diagnostics (guarded)
+        # End-of-run optimization diagnostics
         final_pareto_front_size = None
         final_hypervolume = None
         try:
