@@ -10,7 +10,11 @@ if not hasattr(np, "warnings"):
 from typing import List, Optional, Callable, Union
 from assembled_ensembles.wrapper.abstract_weighted_ensemble import \
     AbstractWeightedEnsemble
-from assembled_ensembles.methods.moo.moo_ensemble_problem import MOOEnsembleProblem, EnsembleSklearnWrapper, PredictLogger
+from assembled_ensembles.methods.moo.moo_ensemble_problem import (
+    MOOEnsembleProblem,
+    EnsembleSklearnWrapper,
+    run_permute_attack_single_instance,
+)
 from assembled_ensembles.util.metrics import AbstractMetric
 from sklearn.utils import check_random_state
 import pickle
@@ -20,7 +24,6 @@ from pymoo.factory import get_algorithm
 from pymoo.optimize import minimize
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 import time
-import multiprocessing as mp
 
 try:
     from pymoo.performance_indicator.hv import Hypervolume as _HV
@@ -28,84 +31,182 @@ except Exception:  # older/newer pymoo or missing module
     _HV = None
 
 # ART Imports for adversarial robustness evaluation
-from art.estimators.classification import SklearnClassifier
 from assembled_ask.util.metatask_base import get_metatask
-from art.estimators.classification import BlackBoxClassifier
-from art.attacks.evasion import HopSkipJump
 
-def _hsj_single_instance_worker(x_i, wrapper, feat_min, feat_max, n_classes, hsj_max_eval, out_queue):
+from assembled.metatask import MetaTask
+from pathlib import Path
+
+from assembled.metatask import MetaTask
+from pathlib import Path
+import json
+import re
+
+def _get_train_data_from_metatask_and_fold(mt, fold_idx):
     """
-    Run HSJ for a single instance inside a separate process.
-    Writes either ("ok", x_adv_i) or ("err", repr(exception)) to out_queue.
+    Extract X_train, y_train from a fully loaded MetaTask using fold_idx.
+    Uses validation_indices if available; otherwise falls back to folds_indicator.
     """
-    try:
-        pred_with_logging = PredictLogger(
-            wrapper.predict_proba,
-            max_eval=hsj_max_eval,
-            name="HSJ_single"
+    X_all = getattr(mt, "dataset", None)
+    y_all = getattr(mt, "ground_truth", None)
+
+    if X_all is None or y_all is None:
+        raise ValueError(
+            f"MetaTask does not expose usable feature data / labels. "
+            f"type(dataset)={type(getattr(mt, 'dataset', None))}, "
+            f"type(ground_truth)={type(getattr(mt, 'ground_truth', None))}"
         )
 
-        clf = BlackBoxClassifier(
-            pred_with_logging,
-            input_shape=(x_i.shape[1],),
-            nb_classes=n_classes,
-            clip_values=(feat_min, feat_max),
-        )
+    # Keep only the true input feature columns, never the target column
+    if hasattr(X_all, "loc"):
+        cols = None
 
-        attack = HopSkipJump(
-            classifier=clf,
-            targeted=False,
-            max_iter=3,
-            max_eval=hsj_max_eval,
-            init_eval=20,
-            init_size=3,
-            verbose=False,
-        )
+        # Prefer non-categorical feature names because you only run numeric datasets
+        if hasattr(mt, "non_cat_feature_names") and mt.non_cat_feature_names is not None:
+            cols = list(mt.non_cat_feature_names)
 
-        x_adv_i = attack.generate(x=x_i)
-        out_queue.put(("ok", np.asarray(x_adv_i, dtype=np.float32)))
-    except Exception as e:
-        out_queue.put(("err", repr(e)))
+        # Fallback: use feature_names, but explicitly remove target_name if present
+        elif hasattr(mt, "feature_names") and mt.feature_names is not None:
+            cols = list(mt.feature_names)
 
+        if cols is not None:
+            target_name = getattr(mt, "target_name", None)
+            if target_name in cols:
+                cols.remove(target_name)
 
-def _run_hsj_single_instance_with_timeout(x_i, wrapper, feat_min, feat_max, n_classes, hsj_max_eval, timeout_sec=1.0):
+            missing_cols = [c for c in cols if c not in X_all.columns]
+            if missing_cols:
+                raise ValueError(
+                    f"Some feature columns are missing in mt.dataset: {missing_cols}. "
+                    f"Available columns: {list(X_all.columns)}"
+                )
+
+            X_all = X_all.loc[:, cols]
+
+    print(f"[MOO-ES] X_all columns used for attack: {list(X_all.columns)}", flush=True)
+    print(f"[MOO-ES] X_all shape after feature subsetting: {X_all.shape}", flush=True)
+
+    if hasattr(mt, "validation_indices") and mt.validation_indices is not None and len(mt.validation_indices) > 0:
+        vi = mt.validation_indices
+
+        if isinstance(vi, dict):
+            if fold_idx in vi:
+                val_idx = np.array(vi[fold_idx], dtype=int)
+            elif str(fold_idx) in vi:
+                val_idx = np.array(vi[str(fold_idx)], dtype=int)
+            else:
+                raise KeyError(
+                    f"fold_idx={fold_idx} not found in mt.validation_indices. "
+                    f"Available keys: {list(vi.keys())}"
+                )
+        else:
+            val_idx = np.array(vi[fold_idx], dtype=int)
+
+        n_samples = len(X_all) if hasattr(X_all, "__len__") else X_all.shape[0]
+        all_idx = np.arange(n_samples, dtype=int)
+        train_idx = np.setdiff1d(all_idx, val_idx, assume_unique=False)
+
+    elif hasattr(mt, "folds_indicator") and mt.folds_indicator is not None:
+        train_idx = np.where(np.asarray(mt.folds_indicator) != fold_idx)[0]
+
+    else:
+        raise ValueError("MetaTask has neither usable validation_indices nor folds_indicator")
+
+    if hasattr(X_all, "iloc"):
+        X_train = X_all.iloc[train_idx]
+    else:
+        X_train = X_all[train_idx]
+
+    if hasattr(y_all, "iloc"):
+        y_train = y_all.iloc[train_idx]
+    else:
+        y_train = y_all[train_idx]
+
+    return X_train, y_train
+
+def _load_full_metatask_from_benchmark_input(openml_task_id, benchmark_name, pruner="SiloTopN", delayed_evaluation_load=False):
     """
-    Run HSJ on a single instance with a hard timeout.
-    Returns (x_adv_i, reason), where:
-      - x_adv_i is np.ndarray of shape (1, d) on success, else None
-      - reason is None on success, else a short string such as 'timeout'
+    Load the full MetaTask from benchmark/input exactly like run_evaluate_ensemble_on_metatask.py.
     """
-    try:
-        ctx = mp.get_context("fork")
-    except ValueError:
-        ctx = mp.get_context()
+    file_path = Path(os.path.dirname(os.path.abspath(__file__)))
+    repo_root = file_path.parents[3]  # .../moo-ensemble-selection
+    tmp_input_dir = repo_root / "moo-ensemble-selection" / "benchmark" / "input" / benchmark_name / pruner
 
-    out_queue = ctx.Queue()
-    proc = ctx.Process(
-        target=_hsj_single_instance_worker,
-        args=(x_i, wrapper, feat_min, feat_max, n_classes, hsj_max_eval, out_queue),
-    )
+    print(f"[MOO-ES] Loading full MetaTask from: {tmp_input_dir}", flush=True)
 
-    proc.start()
-    proc.join(timeout_sec)
+    mt = MetaTask()
+    mt.read_metatask_from_files(tmp_input_dir, str(openml_task_id), delayed_evaluation_load=delayed_evaluation_load)
 
-    if proc.is_alive():
-        proc.terminate()
-        proc.join()
+    #print(f"[MOO-ES] Loaded MetaTask. Has X: {getattr(mt, 'X', None) is not None}, "
+    #      f"has ground_truth: {getattr(mt, 'ground_truth', None) is not None}", flush=True)
+
+    return mt
+
+def _get_train_data_from_passed_validation(mt, X_val_passed):
+    """
+    Reconstruct X_train, y_train from the full MetaTask data and the validation
+    split that is already passed into ensemble_passthrough_fit via passthrough.
+
+    Preferred behavior:
+    1) If indices are preserved, use index complement.
+    2) Otherwise, fall back to row-wise matching by feature values.
+    """
+    X_all = getattr(mt, "X", None)
+    y_all = getattr(mt, "ground_truth", None)
+    if X_all is None or y_all is None:
+        raise ValueError("MetaTask does not expose X/ground_truth. Ensure full dataset was loaded.")
+
+    # ------------------------------------------------------------
+    # Case 1: index-preserving pandas objects
+    # ------------------------------------------------------------
+    if hasattr(X_all, "index") and hasattr(X_val_passed, "index"):
         try:
-            out_queue.close()
+            val_index = X_val_passed.index
+            train_mask = ~X_all.index.isin(val_index)
+
+            X_train = X_all.loc[train_mask]
+            y_train = y_all.loc[train_mask] if hasattr(y_all, "loc") else y_all[train_mask]
+            return X_train, y_train
         except Exception:
             pass
-        return None, "timeout"
 
-    if not out_queue.empty():
-        status, payload = out_queue.get()
-        if status == "ok":
-            return payload, None
-        return None, payload
+    # ------------------------------------------------------------
+    # Case 2: fallback to row-wise matching by values
+    # ------------------------------------------------------------
+    X_all_np = X_all.to_numpy() if hasattr(X_all, "to_numpy") else np.asarray(X_all)
+    X_val_np = X_val_passed.to_numpy() if hasattr(X_val_passed, "to_numpy") else np.asarray(X_val_passed)
 
-    return None, "no_result"
+    if X_all_np.ndim != 2 or X_val_np.ndim != 2:
+        raise ValueError("Expected 2D feature matrices for X_all and X_val_passed.")
 
+    n_all = X_all_np.shape[0]
+    train_mask = np.ones(n_all, dtype=bool)
+
+    # Mark the first matching occurrence in X_all for every validation row as validation
+    # so that duplicates are handled conservatively.
+    used = np.zeros(n_all, dtype=bool)
+
+    for row in X_val_np:
+        row_matches = np.where(np.all(np.isclose(X_all_np, row, rtol=1e-8, atol=1e-10, equal_nan=True), axis=1))[0]
+        row_matches = row_matches[~used[row_matches]]
+
+        if len(row_matches) == 0:
+            raise ValueError("Could not match a passed validation row back to mt.X while reconstructing training data.")
+
+        match_idx = row_matches[0]
+        used[match_idx] = True
+        train_mask[match_idx] = False
+
+    if hasattr(X_all, "iloc"):
+        X_train = X_all.iloc[train_mask]
+    else:
+        X_train = X_all[train_mask]
+
+    if hasattr(y_all, "iloc"):
+        y_train = y_all.iloc[train_mask]
+    else:
+        y_train = y_all[train_mask]
+
+    return X_train, y_train
 
 def _get_val_data_from_metatask(mt,
                                 fold_idx):  # Currently not needed because we can just set passthrough = true to get access to the validation data
@@ -141,6 +242,63 @@ def _get_val_data_from_metatask(mt,
     return X_val, y_val
 
 
+def _get_train_data_from_metatask(mt, fold_idx):
+    """
+    Helper to extract X_train, y_train from a MetaTask for the given fold.
+    It computes the training indices as the complement of the validation/test indices for that fold.
+
+    This works if MetaTask provides either:
+      - validation_indices: a list/array with validation indices per fold, or
+      - folds_indicator: an array marking which fold each sample belongs to (as the validation/test fold).
+    """
+    # Determine training indices
+    if hasattr(mt, "validation_indices") and mt.validation_indices is not None:
+        vi = mt.validation_indices
+
+        if isinstance(vi, dict):
+            if fold_idx in vi:
+                val_idx = np.array(vi[fold_idx], dtype=int)
+            elif str(fold_idx) in vi:
+                val_idx = np.array(vi[str(fold_idx)], dtype=int)
+            else:
+                raise KeyError(
+                    f"fold_idx={fold_idx} not found in mt.validation_indices. "
+                    f"Available keys: {list(vi.keys())}"
+                )
+        else:
+            val_idx = np.array(vi[fold_idx], dtype=int)
+        # Build complement over all samples
+        X_all = getattr(mt, "X", None)
+        if X_all is None:
+            raise ValueError("MetaTask does not expose X. Ensure full dataset was loaded before calling this.")
+        n_samples = len(X_all) if hasattr(X_all, "__len__") else X_all.shape[0]
+        all_idx = np.arange(n_samples, dtype=int)
+        train_idx = np.setdiff1d(all_idx, val_idx, assume_unique=False)
+    elif hasattr(mt, "folds_indicator") and mt.folds_indicator is not None:
+        # All samples that are NOT assigned to the current fold are considered training
+        train_idx = np.where(np.asarray(mt.folds_indicator) != fold_idx)[0]
+    else:
+        raise ValueError("MetaTask has neither validation_indices nor folds_indicator")
+
+    X_all = getattr(mt, "X", None)
+    y_all = getattr(mt, "ground_truth", None)
+    if X_all is None or y_all is None:
+        raise ValueError("MetaTask does not expose X/ground_truth. Ensure full dataset was loaded.")
+
+    # Slice robustly for pandas or numpy
+    if hasattr(X_all, "iloc"):
+        X_train = X_all.iloc[train_idx]
+    else:
+        X_train = X_all[train_idx]
+
+    if hasattr(y_all, "iloc"):
+        y_train = y_all.iloc[train_idx]
+    else:
+        y_train = y_all[train_idx]
+
+    return X_train, y_train
+
+
 class MOOEnsembleSelection(AbstractWeightedEnsemble):
     supports_passthrough = True  # Declare passthrough support so AbstractEnsemble.fit can route validation data
     """
@@ -161,14 +319,17 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
     n_jobs: int, default=-1
         Cores to use for parallelization. If -1, use all available cores.
         Please be aware that multi-processing introduces a time overhead.
-
+    reattack_top5_only: bool, default=True
+        When set to True, only the top-5 ensembles (based on clean accuracy) in the pareto front will be re-attacked.
+        When set to False, all pareto-optimal ensembles will be re-attacked.
     TODO: Add parameter for final ensemble selection (value between 0 and 1 to prioritize either accuracy or robustness).
     """
 
     # Initialize parameters for MOO Ensemble Selection
     def __init__(self, base_models: List[Callable], n_generations: int, population_size: int,
                  score_metric: AbstractMetric, random_state: Optional[Union[int, np.random.RandomState]] = None,
-                 n_jobs: int = -1, passthrough: bool = True) -> None:
+                 n_jobs: int = -1, passthrough: bool = True, reattack_top5_only: bool = True,
+                 permute_attack_kwargs: Optional[dict] = None) -> None:
         super().__init__(
             base_models,
             "predict_proba",
@@ -179,6 +340,21 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         self.score_metric = score_metric
         self.random_state = check_random_state(random_state)
         self.n_jobs = n_jobs
+        self.reattack_top5_only = reattack_top5_only
+
+        default_permute_attack_kwargs = dict(
+            sol_per_pop=35,
+            num_parents_mating=15,
+            num_generations=100,
+            n_runs=1,
+            beta=0.96,
+            black_list=None,
+            verbose=False,
+            target=None,
+        )
+        if permute_attack_kwargs is not None:
+            default_permute_attack_kwargs.update(permute_attack_kwargs)
+        self.permute_attack_kwargs = default_permute_attack_kwargs
 
     def ensemble_passthrough_predict(self, X, base_model_predictions):
         """
@@ -236,8 +412,11 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         import json
 
         md0 = getattr(self.base_models[0], "model_metadata", None)
+
         if not isinstance(md0, dict):
             raise ValueError("Base model[0] lacks 'model_metadata' dict; cannot locate metatask_schema.json")
+
+
 
         # Prefer values directly from metadata (if present)
         dataset_name = md0.get("dataset_name")
@@ -275,8 +454,64 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             # Raise to abort the fold cleanly -> Skip scoring
             raise RuntimeError("Datasets with categorical input features are not supported yet for MOO-ES")
         # -------------------------------------------------------------------------------
+        base_model_path = md0.get("base_model_path")
+        if not isinstance(base_model_path, str):
+            raise ValueError("Cannot infer fold_idx: model_metadata['base_model_path'] is missing or not a string.")
 
+        m = re.search(r"/fold_(\d+)(?:/|$)", base_model_path)
+        if m is None:
+            raise ValueError(f"Cannot infer fold_idx from base_model_path: {base_model_path!r}")
 
+        fold_idx = int(m.group(1))
+        print(f"[MOO-ES] Inferred fold_idx={fold_idx} from base_model_path.", flush=True)
+
+        mt = _load_full_metatask_from_benchmark_input(
+            openml_task_id=openml_task_id,
+            benchmark_name=dataset_name,
+            pruner="SiloTopN",
+            delayed_evaluation_load=False,
+        )
+
+        # DEBUG PRINTS
+        #print(f"[MOO-ES] type(mt.X) = {type(getattr(mt, 'X', None))}", flush=True)
+        #print(f"[MOO-ES] type(mt.ground_truth) = {type(getattr(mt, 'ground_truth', None))}", flush=True)
+        #print(f"[MOO-ES] type(mt.dataset_frame) = {type(getattr(mt, 'dataset_frame', None))}", flush=True)
+        #print(f"[MOO-ES] type(mt.data_frame) = {type(getattr(mt, 'data_frame', None))}", flush=True)
+        #print(f"[MOO-ES] mt attributes sample = {[a for a in dir(mt) if not a.startswith('_')][:80]}", flush=True)
+
+        #print(f"[MOO-ES] type(mt.dataset) = {type(getattr(mt, 'dataset', None))}", flush=True)
+        #print(f"[MOO-ES] type(mt.meta_dataset) = {type(getattr(mt, 'meta_dataset', None))}", flush=True)
+
+        ds = getattr(mt, "dataset", None)
+        mds = getattr(mt, "meta_dataset", None)
+
+        if ds is not None:
+            try:
+                print(f"[MOO-ES] mt.dataset shape = {ds.shape}", flush=True)
+            except Exception:
+                print("[MOO-ES] mt.dataset has no shape attribute", flush=True)
+
+        if mds is not None:
+            try:
+                print(f"[MOO-ES] mt.meta_dataset shape = {mds.shape}", flush=True)
+            except Exception:
+                print("[MOO-ES] mt.meta_dataset has no shape attribute", flush=True)
+
+        # DEBUG PRINTS END
+
+        #print(f"[MOO-ES] validation_indices type: {type(mt.validation_indices)}", flush=True)
+        #if isinstance(mt.validation_indices, dict):
+        #    print(f"[MOO-ES] validation_indices keys: {list(mt.validation_indices.keys())}", flush=True)
+
+        X_train_attack, y_train_attack = _get_train_data_from_metatask_and_fold(mt, fold_idx)
+
+        if hasattr(X_train_attack, "to_numpy"):
+            X_train_attack = X_train_attack.to_numpy()
+        X_train_attack = np.asarray(X_train_attack, dtype=np.float32)
+
+        self.model_specific_metadata_["fold_idx"] = int(fold_idx)
+        self.model_specific_metadata_["train_shape"] = tuple(X_train_attack.shape)
+        # ------------------------------------------------------------
 
 
         # Number of base models
@@ -344,24 +579,39 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
 
         perturbed_sets = []  # list to store perturbed validation sets
         origin_idx = []      # origin model index (needed to use ensemble weightening during optimization)
+        adv_success_masks = []  # true only where a real adversarial copy was found
+        base_model_attack_stats = [] # storing success / failure stats for each base model
 
-        # Use per-feature bounds / clip-values
         X_np = np.asarray(X, dtype=np.float32)
-        feat_min = X_np.min(axis=0)
-        feat_max = X_np.max(axis=0)
-        same = feat_max <= feat_min
-        feat_max[same] = feat_min[same] + 1e-8
-        print(f"[MOO-ES] Using per-feature clip_values with shapes: {feat_min.shape}, {feat_max.shape}", flush=True)
-
-        HSJ_MAX_EVAL = 25
 
         for m_idx, bm in enumerate(actual_base_models):
             print(f"[MOO-ES] Generating adversarial set for base model {m_idx}", flush=True)
 
+            model_type = type(bm).__name__
+
+            try:
+                if hasattr(bm, "steps") and len(bm.steps) > 0:
+                    last_step = bm.steps[-1][1]
+
+                    if hasattr(last_step, "choice") and last_step.choice is not None:
+                        model_type = type(last_step.choice).__name__
+                    else:
+                        model_type = type(last_step).__name__
+
+            except Exception:
+                pass
+
+            print(
+                f"[MOO-ES] Base model {m_idx}: extracted model_type={model_type}",
+                flush=True,
+            )
+
+            attack_classes = np.arange(len(self.classes_))
+
             wrapper = EnsembleSklearnWrapper(
                 base_models=[bm],
                 weights=np.array([1.0], dtype=float),
-                classes_=self.classes_,
+                classes_=attack_classes,
                 feature_names=feature_names_for_attack,
             ).fit()
 
@@ -389,66 +639,92 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
                     f"Using clean validation copy as adversarial fallback block.",
                     flush=True,
                 )
+
+                success_mask_full = np.zeros(x_adv_full.shape[0], dtype=bool)
+
                 perturbed_sets.append(x_adv_full)
                 origin_idx.append(np.full(x_adv_full.shape[0], m_idx, dtype=int))
+                adv_success_masks.append(success_mask_full)
+
                 print(f"[MOO-ES] Done generating adversarial set for model {m_idx}", flush=True)
                 continue
 
-            # Attack only the clean-correct subset
+            # Attack only the clean-correct subset using PermuteAttack
             X_sub = X_np[clean_mask]
 
             print(
                 f"[MOO-ES] Base model {m_idx}: attacking only clean-correct subset "
-                f"with shape={X_sub.shape} using per-instance HSJ (5s timeout)",
+                f"with shape={X_sub.shape} using PermuteAttack",
                 flush=True,
             )
 
             clean_indices = np.where(clean_mask)[0]
-            n_timeout = 0
+            labels_np = np.asarray(labels)
             n_failed = 0
             n_success = 0
+            success_mask_full = np.zeros(x_adv_full.shape[0], dtype=bool)
 
-            for orig_idx in clean_indices:
-                x_i = X_np[orig_idx:orig_idx + 1]
+            # DEBUG PRINTS
+            #print(
+            #    f"[MOO-ES] Wrapper classes_ dtype={np.asarray(wrapper.classes_).dtype}, "
+            #    f"classes_={wrapper.classes_}",
+            #    flush=True,
+            #)
 
-                x_adv_i, fail_reason = _run_hsj_single_instance_with_timeout(
+            for local_counter, orig_idx in enumerate(clean_indices, start=1):
+
+                if local_counter % 50 == 0 or local_counter == len(clean_indices):
+                    print(
+                        f"[MOO-ES] Base model {m_idx}: PermuteAttack progress "
+                        f"{local_counter}/{len(clean_indices)} instances",
+                        flush=True,
+                    )
+
+                x_i = X_np[orig_idx]
+
+                x_adv_i, fail_reason = run_permute_attack_single_instance(
+                    estimator=wrapper,
                     x_i=x_i,
-                    wrapper=wrapper,
-                    feat_min=feat_min,
-                    feat_max=feat_max,
-                    n_classes=len(self.classes_),
-                    hsj_max_eval=HSJ_MAX_EVAL,
-                    timeout_sec=1.0,
+                    x_train=X_train_attack,
+                    true_label=labels_np[orig_idx],
+                    feature_names=feature_names_for_attack,
+                    **self.permute_attack_kwargs,
                 )
 
                 if x_adv_i is None:
-                    if fail_reason == "timeout":
-                        n_timeout += 1
-                        print(
-                            f"[MOO-ES] Base model {m_idx}: HSJ timeout on instance {orig_idx}; "
-                            f"keeping clean fallback.",
-                            flush=True,
-                        )
-                    else:
-                        n_failed += 1
-                        print(
-                            f"[MOO-ES] Base model {m_idx}: HSJ failed on instance {orig_idx} "
-                            f"with reason={fail_reason}; keeping clean fallback.",
-                            flush=True,
-                        )
+                    n_failed += 1
+                    #print(
+                    #    f"[MOO-ES] Base model {m_idx}: PermuteAttack failed on instance {orig_idx} "
+                    #    f"with reason={fail_reason}; keeping clean fallback.",
+                    #    flush=True,
+                    #)
                     continue
 
                 x_adv_full[orig_idx] = x_adv_i[0]
+                success_mask_full[orig_idx] = True
                 n_success += 1
 
             print(
-                f"[MOO-ES] Base model {m_idx}: per-instance HSJ finished | "
-                f"success={n_success}, timeout={n_timeout}, failed={n_failed}",
+                f"[MOO-ES] PermuteAttack finished for base model {m_idx} | "
+                f"success={n_success}, failed={n_failed}",
                 flush=True,
             )
 
+            success_rate = float(n_success / max(1, n_clean_correct))
+
+            # Store success / failure stats for this base model
+            base_model_attack_stats.append({
+                "base_model_id": int(m_idx),
+                "base_model_type": str(model_type),
+                "n_clean_correct": int(n_clean_correct),
+                "n_success": int(n_success),
+                "n_failed": int(n_failed),
+                "success_rate": success_rate,
+            })
+
             perturbed_sets.append(x_adv_full)
             origin_idx.append(np.full(x_adv_full.shape[0], m_idx, dtype=int))
+            adv_success_masks.append(success_mask_full)
 
             print(
                 f"[MOO-ES] Done generating adversarial set for model {m_idx} "
@@ -459,12 +735,13 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         if len(perturbed_sets) > 0:
             U = np.vstack(perturbed_sets)
             U_labels = np.hstack([labels for _ in range(len(perturbed_sets))])
-            U_origin = np.hstack(origin_idx)
+            adv_success_mask = np.hstack(adv_success_masks)
         else:
             X_np = np.asarray(X, dtype=np.float32)
             U = np.empty((0, X_np.shape[1]), dtype=X_np.dtype)
             U_labels = np.empty((0,), dtype=np.asarray(labels).dtype)
-            U_origin = np.empty((0,), dtype=int)
+            adv_success_mask = np.empty((0,), dtype=bool)
+
         print(f"[MOO-ES] Built union pool U with shape {getattr(U, 'shape', None)}", flush=True)
 
         # Build cached predictions for adversarial union pool
@@ -479,8 +756,9 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
                     U_for_models = pd.DataFrame(U, columns=list(feature_names_for_attack))
                 except Exception:
                     U_for_models = U
+
+            print(f"[MOO-ES] Caching predict_proba on U for base models")
             for j, bm in enumerate(actual_base_models):
-                print(f"[MOO-ES] Caching predict_proba on U for base model {j}", flush=True)
                 adv_union_predictions.append(bm.predict_proba(U_for_models))
             adv_union_predictions = np.asarray(adv_union_predictions)
         print(f"[MOO-ES] Cached adv_union_predictions with shape {getattr(adv_union_predictions, 'shape', None)}", flush=True)
@@ -497,9 +775,12 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             random_state=self.random_state,
             n_jobs=self.n_jobs,
             classes_=self.classes_,
-            base_models_metadata=(self.base_models_metadata_ if getattr(self, 'base_models_metadata_exists', False) else None),
+            base_models_metadata=(
+                self.base_models_metadata_ if getattr(self, 'base_models_metadata_exists', False) else None),
             adv_union_predictions=adv_union_predictions,
             adv_union_labels=U_labels,
+            X_train_attack=X_train_attack,
+            permute_attack_kwargs=self.permute_attack_kwargs,
         )
 
         algorithm = get_algorithm("nsga2", pop_size=self.population_size, eliminate_duplicates=True)
@@ -646,26 +927,84 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         for i, (a, r) in enumerate(zip(pareto_acc, pareto_robust_surr)):
             print(f"[MOO-ES] Pareto-optimal ensemble (surrogate) idx={i} | accuracy={a:.6f} | adv_acc_surr={r:.6f}", flush=True)
 
-        print("[MOO-ES] Re-attacking Pareto-optimal ensembles to compute true robustness", flush=True)
+        if self.reattack_top5_only:
+            top_k = min(5, len(pareto_weights))
+            reattack_idx = np.argsort(-pareto_acc)[:top_k]
+            print(
+                f"[MOO-ES] Re-attacking only top {top_k} Pareto-optimal ensembles by accuracy: "
+                f"{reattack_idx.tolist()}",
+                flush=True,
+            )
+        else:
+            reattack_idx = np.arange(len(pareto_weights))
+            print("[MOO-ES] Re-attacking all Pareto-optimal ensembles to compute true robustness", flush=True)
+
         _t0_reattack = time.perf_counter()
-        true_robust_list = []
-        for i, w in enumerate(pareto_weights):
-            w = np.asarray(w, dtype=float)
+
+        pareto_robust_true = np.full(len(pareto_weights), np.nan, dtype=float)
+
+        pareto_attack_stats = []
+
+        for i in reattack_idx:
+            w = np.asarray(pareto_weights[i], dtype=float)
             if w.sum() == 0:
                 w = np.ones_like(w) / len(w)
             else:
                 w = w / w.sum()
+
             print(f"[MOO-ES] Re-attack ensemble {i} ...", flush=True)
             try:
-                adv_acc_true = float(problem._evaluate_robustness(w))
+                attack_result = problem._evaluate_robustness(w)
+                adv_acc_true = float(attack_result["adv_accuracy"])
             except Exception as e:
                 print(f"[MOO-ES] WARNING: re-attack failed for candidate {i}: {e}", flush=True)
-                adv_acc_true = float('nan')
-            true_robust_list.append(adv_acc_true)
+                attack_result = {
+                    "adv_accuracy": float("nan"),
+                    "n_clean_correct": None,
+                    "n_success": None,
+                    "n_failed": None,
+                    "success_rate": None,
+                }
+                adv_acc_true = float("nan")
+
+            pareto_robust_true[i] = adv_acc_true
+
+            pareto_attack_stats.append({
+                "pareto_index": int(i),
+                "adv_accuracy": None if np.isnan(adv_acc_true) else float(adv_acc_true),
+                "n_clean_correct": attack_result["n_clean_correct"],
+                "n_success": attack_result["n_success"],
+                "n_failed": attack_result["n_failed"],
+                "success_rate": attack_result["success_rate"],
+            })
+
             print(f"[MOO-ES] true_adv_accuracy={adv_acc_true}", flush=True)
+
         _t1_reattack = time.perf_counter()
 
-        pareto_robust_true = np.asarray(true_robust_list, dtype=float)
+        # ------------------------------------------------------------
+        # Select the best re-attacked Pareto ensemble by true robustness
+        # ------------------------------------------------------------
+        valid_true_robustness_mask = np.isfinite(pareto_robust_true)
+
+        if np.any(valid_true_robustness_mask):
+            valid_indices = np.where(valid_true_robustness_mask)[0]
+
+            # Choose the re-attacked Pareto solution with highest true adversarial robustness.
+            # Tie-breaker: higher clean accuracy.
+            robust_rank_order = sorted(
+                valid_indices,
+                key=lambda idx: (pareto_robust_true[idx], pareto_acc[idx]),
+                reverse=True,
+            )
+
+            best_true_robust_index = int(robust_rank_order[0])
+            best_true_robust_accuracy = float(pareto_acc[best_true_robust_index])
+            best_true_robust_robustness = float(pareto_robust_true[best_true_robust_index])
+        else:
+            best_true_robust_index = None
+            best_true_robust_accuracy = None
+            best_true_robust_robustness = None
 
         # Select final solution by highest accuracy
         best_index = int(np.argmax(pareto_acc))
@@ -720,12 +1059,19 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             pareto_accuracy=[float(v) for v in pareto_acc.tolist()],
             pareto_surrogate_robustness=[float(v) for v in pareto_robust_surr.tolist()],
             pareto_true_robustness=[None if np.isnan(v) else float(v) for v in pareto_robust_true.tolist()],
-            selected_index=int(best_index),
-            selected_accuracy=float(pareto_acc[best_index]),
-            selected_robustness_true=None if np.isnan(pareto_robust_true[best_index]) else float(pareto_robust_true[best_index]),
+            best_acc_index=int(best_index),
+            best_acc_accuracy=float(pareto_acc[best_index]),
+            best_acc_robustness_true=None if np.isnan(pareto_robust_true[best_index]) else float(pareto_robust_true[best_index]),
+            best_rob_index=best_true_robust_index,
+            best_rob_accuracy=best_true_robust_accuracy,
+            best_rob_robustness_true=best_true_robust_robustness,
             # End-of-run diagnostics
             final_pareto_front_size=final_pareto_front_size,
             final_hypervolume=final_hypervolume,
+            # Stats on attack success per base model
+            base_model_attack_stats=base_model_attack_stats,
+            # Stats on attack success per ensemble
+            pareto_attack_stats=pareto_attack_stats,
             # Wall-clock times
             wallclock_total_sec=float(_t1_total - _t0_total),
             wallclock_precompute_adv_pool_sec=float(_t1_pool - _t0_pool),

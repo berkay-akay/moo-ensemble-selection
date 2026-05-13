@@ -18,8 +18,109 @@ from assembled_ensembles.methods.qdo.custom_archives.custom_sliding_boundaries_a
 from functools import partial
 import pickle
 
+import re
+from pathlib import Path
+import json
+
 from concurrent.futures import ProcessPoolExecutor
 
+from assembled.metatask import MetaTask
+from assembled_ensembles.methods.moo.moo_ensemble_problem import (
+    EnsembleSklearnWrapper,
+    run_permute_attack_single_instance,
+)
+
+def _load_full_metatask_from_benchmark_input(openml_task_id, benchmark_name, pruner="SiloTopN", delayed_evaluation_load=False):
+    """
+    Load the full MetaTask from benchmark/input exactly like run_evaluate_ensemble_on_metatask.py.
+    """
+    file_path = Path(os.path.dirname(os.path.abspath(__file__)))
+    repo_root = file_path.parents[3]  # .../moo-ensemble-selection
+    tmp_input_dir = repo_root / "moo-ensemble-selection" / "benchmark" / "input" / benchmark_name / pruner
+
+    print(f"[QDO-ES] Loading full MetaTask from: {tmp_input_dir}", flush=True)
+
+    mt = MetaTask()
+    mt.read_metatask_from_files(tmp_input_dir, str(openml_task_id), delayed_evaluation_load=delayed_evaluation_load)
+    return mt
+
+def _get_train_data_from_metatask_and_fold(mt, fold_idx):
+    """
+    Extract X_train, y_train from a fully loaded MetaTask using fold_idx.
+    Uses validation_indices if available; otherwise falls back to folds_indicator.
+    """
+    X_all = getattr(mt, "dataset", None)
+    y_all = getattr(mt, "ground_truth", None)
+
+    if X_all is None or y_all is None:
+        raise ValueError(
+            f"MetaTask does not expose usable feature data / labels. "
+            f"type(dataset)={type(getattr(mt, 'dataset', None))}, "
+            f"type(ground_truth)={type(getattr(mt, 'ground_truth', None))}"
+        )
+
+    if hasattr(X_all, "loc"):
+        cols = None
+
+        if hasattr(mt, "non_cat_feature_names") and mt.non_cat_feature_names is not None:
+            cols = list(mt.non_cat_feature_names)
+        elif hasattr(mt, "feature_names") and mt.feature_names is not None:
+            cols = list(mt.feature_names)
+
+        if cols is not None:
+            target_name = getattr(mt, "target_name", None)
+            if target_name in cols:
+                cols.remove(target_name)
+
+            missing_cols = [c for c in cols if c not in X_all.columns]
+            if missing_cols:
+                raise ValueError(
+                    f"Some feature columns are missing in mt.dataset: {missing_cols}. "
+                    f"Available columns: {list(X_all.columns)}"
+                )
+
+            X_all = X_all.loc[:, cols]
+
+    print(f"[QDO-ES] X_all columns used for attack: {list(X_all.columns)}", flush=True)
+    print(f"[QDO-ES] X_all shape after feature subsetting: {X_all.shape}", flush=True)
+
+    if hasattr(mt, "validation_indices") and mt.validation_indices is not None and len(mt.validation_indices) > 0:
+        vi = mt.validation_indices
+
+        if isinstance(vi, dict):
+            if fold_idx in vi:
+                val_idx = np.array(vi[fold_idx], dtype=int)
+            elif str(fold_idx) in vi:
+                val_idx = np.array(vi[str(fold_idx)], dtype=int)
+            else:
+                raise KeyError(
+                    f"fold_idx={fold_idx} not found in mt.validation_indices. "
+                    f"Available keys: {list(vi.keys())}"
+                )
+        else:
+            val_idx = np.array(vi[fold_idx], dtype=int)
+
+        n_samples = len(X_all) if hasattr(X_all, "__len__") else X_all.shape[0]
+        all_idx = np.arange(n_samples, dtype=int)
+        train_idx = np.setdiff1d(all_idx, val_idx, assume_unique=False)
+
+    elif hasattr(mt, "folds_indicator") and mt.folds_indicator is not None:
+        train_idx = np.where(np.asarray(mt.folds_indicator) != fold_idx)[0]
+
+    else:
+        raise ValueError("MetaTask has neither usable validation_indices nor folds_indicator")
+
+    if hasattr(X_all, "iloc"):
+        X_train = X_all.iloc[train_idx]
+    else:
+        X_train = X_all[train_idx]
+
+    if hasattr(y_all, "iloc"):
+        y_train = y_all.iloc[train_idx]
+    else:
+        y_train = y_all[train_idx]
+
+    return X_train, y_train
 
 class QDOEnsembleSelection(AbstractWeightedEnsemble):
     supports_passthrough = True
@@ -447,194 +548,241 @@ class QDOEnsembleSelection(AbstractWeightedEnsemble):
         return actual_base_models
 
     def evaluate_robustness(self, X, y):
-        """Post-hoc adversarial robustness evaluation of the final ensemble (HSJ attack).
-        Stores adversarial accuracy in self.validation_robustness_ and logs params in self.model_specific_metadata_.
         """
-        # Lazy imports to avoid overhead unless used
-        from assembled_ensembles.methods.moo.moo_ensemble_problem import (
-            EnsembleSklearnWrapper, PredictLogger,
-        )
-        from art.attacks.evasion import HopSkipJump
-        from art.estimators.classification import BlackBoxClassifier
+        Post-hoc adversarial robustness evaluation of the final ensemble using PermuteAttack.
+        Stores adversarial accuracy in self.validation_robustness_ and logs params/stats in
+        self.model_specific_metadata_["robustness"].
+        """
         import numpy as _np
 
-        # Normalize weights to sum to 1 to guard numerical drift
+        from assembled_ensembles.methods.moo.moo_ensemble_problem import (
+            EnsembleSklearnWrapper,
+            run_permute_attack_single_instance,
+        )
+
+        if not hasattr(self, "weights_"):
+            raise RuntimeError("weights_ missing; ensemble must be fitted before robustness evaluation.")
+
+        # Normalize weights
         w = _np.asarray(self.weights_, dtype=float)
-        w_sum = _np.sum(w)
-        if not _np.isfinite(w_sum) or w_sum == 0:
-            raise ValueError("Invalid weights for robustness evaluation.")
+        w_sum = float(w.sum())
+        if (not _np.isfinite(w_sum)) or (w_sum <= 0.0):
+            raise ValueError("Invalid ensemble weights for robustness evaluation.")
         w = w / w_sum
 
         # Recover feature names from metadata if available
         feature_names = None
         try:
-            if getattr(self, 'base_models_metadata_exists', False) and hasattr(self, 'base_models_metadata_'):
+            if getattr(self, "base_models_metadata_exists", False) and hasattr(self, "base_models_metadata_"):
                 meta0 = self.base_models_metadata_[0] if len(self.base_models_metadata_) > 0 else None
                 if isinstance(meta0, dict):
-                    feature_names = meta0.get('feature_names') or meta0.get('columns') or meta0.get('feature_names_in_')
+                    feature_names = (
+                            meta0.get("feature_names")
+                            or meta0.get("columns")
+                            or meta0.get("feature_names_in_")
+                    )
         except Exception:
             feature_names = None
 
-        X_for_models = X
-        if feature_names is not None:
-            try:
-                import pandas as pd
-                X_for_models = pd.DataFrame(X, columns=list(feature_names))
-            except Exception:
-                X_for_models = X
+        # Infer dataset / task / fold from fake base model metadata
+        md0 = getattr(self.base_models[0], "model_metadata", None)
+        if not isinstance(md0, dict):
+            raise ValueError("Base model[0] lacks model_metadata; cannot reconstruct training data for PermuteAttack.")
 
-        # Compute per-feature clip values based on the full X (not just the subset)
-        X_arr = _np.asarray(X_for_models if not hasattr(X_for_models, 'values') else X_for_models.values)
-        X_arr = X_arr.astype(_np.float32, copy=False)
-        feat_min = X_arr.min(axis=0)
-        feat_max = X_arr.max(axis=0)
-        same = feat_max <= feat_min
-        feat_max[same] = feat_min[same] + 1e-8
+        dataset_name = md0.get("dataset_name")
+        openml_task_id = md0.get("openml_task_id")
 
-        # Build sklearn-compatible ensemble wrapper around actual base models
+        if dataset_name is None or openml_task_id is None:
+            mt_path = md0.get("metatask_json_path") or md0.get("metatask_path")
+            if not mt_path:
+                raise ValueError("Missing dataset_name/openml_task_id in metadata and no metatask path to infer them.")
+            with open(mt_path, "r", encoding="utf-8") as f:
+                mt_json = json.load(f)
+            dataset_name = dataset_name or mt_json.get("dataset_name")
+            openml_task_id = openml_task_id or mt_json.get("openml_task_id")
+
+        base_model_path = md0.get("base_model_path")
+        if not isinstance(base_model_path, str):
+            raise ValueError("Cannot infer fold_idx: model_metadata['base_model_path'] missing or not a string.")
+
+        m = re.search(r"/fold_(\d+)(?:/|$)", base_model_path)
+        if m is None:
+            raise ValueError(f"Cannot infer fold_idx from base_model_path: {base_model_path!r}")
+        fold_idx = int(m.group(1))
+
+        # Load full MetaTask and reconstruct train split for PermuteAttack
+        mt = _load_full_metatask_from_benchmark_input(
+            openml_task_id=openml_task_id,
+            benchmark_name=dataset_name,
+            pruner="SiloTopN",
+            delayed_evaluation_load=False,
+        )
+        X_train_attack, y_train_attack = _get_train_data_from_metatask_and_fold(mt, fold_idx)
+
+        if hasattr(X_train_attack, "to_numpy"):
+            X_train_attack = X_train_attack.to_numpy()
+        X_train_attack = _np.asarray(X_train_attack, dtype=_np.float32)
+
+        # Make sure we use real sklearn base models
+        self._load_actual_base_models()
+
+        # Build attack wrapper with integer classes exactly like MOO-ES
+        attack_classes = _np.arange(len(self.classes_))
         ensemble_model = EnsembleSklearnWrapper(
             base_models=self.base_models,
             weights=w,
-            classes_=self.classes_,
+            classes_=attack_classes,
             feature_names=feature_names,
         )
         ensemble_model.fit()
 
-        # Optional: enable ART logging (mirrors MOO‑ES)
-        import logging
-        root = logging.getLogger()
-        if not root.handlers:
-            h = logging.StreamHandler()
-            h.setLevel(logging.INFO)
-            h.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s"))
-            root.addHandler(h)
-            root.setLevel(logging.INFO)
-        for name in ("art", "art.attacks", "art.attacks.evasion"):
-            logging.getLogger(name).setLevel(logging.INFO)
+        print("[QDO-ES] entering evaluate_robustness with PermuteAttack", flush=True)
 
-        print("[RobustnessEval] entering evaluate_robustness", flush=True)
-
-        # Compute clean predictions to get the clean-correct mask (on full set)
-        proba_clean = ensemble_model.predict_proba(X_arr)  # (N, C)
+        # Use raw validation features
+        X_all = _np.asarray(X, dtype=_np.float32)
         y_true = _np.asarray(y)
+
+        # Clean-correct mask
+        proba_clean = ensemble_model.predict_proba(X_all)
         y_pred_clean = _np.argmax(proba_clean, axis=1)
         mask = (y_pred_clean == y_true)
         num_correct = int(mask.sum())
+
         print(
-            f"[RobustnessEval] clean-correct mask computed: num_clean_correct={num_correct} / N={len(y_true)}",
+            f"[QDO-ES] clean-correct mask computed: num_clean_correct={num_correct} / N={len(y_true)}",
             flush=True,
         )
+
         if num_correct == 0:
-            print("[RobustnessEval] No clean-correct instances; returning 0.0", flush=True)
             self.validation_robustness_ = 0.0
-            # Update metadata (still record the attempt)
-            if not hasattr(self, 'model_specific_metadata_') or self.model_specific_metadata_ is None:
-                self.model_specific_metadata_ = {}
             self.model_specific_metadata_["robustness"] = dict(
-                robustness_attack="HopSkipJump",
-                attack_params=dict(max_iter=3, max_eval=25, init_eval=20, init_size=3, targeted=False),
-                n_samples=int(len(X_arr)),
-                n_clean_correct=int(num_correct),
-                n_classes=int(len(self.classes_)),
-                clip_values="per-feature",
+                robustness_attack="PermuteAttack",
+                attack_params={
+                    "sol_per_pop": 35,
+                    "num_parents_mating": 15,
+                    "num_generations": 100,
+                    "n_runs": 1,
+                    "beta": 0.96,
+                    "black_list": None,
+                    "verbose": False,
+                    "target": None,
+                },
+                n_samples=int(len(X_all)),
+                n_clean_correct=0,
+                n_success=0,
+                n_failed=0,
+                success_rate=0.0,
                 weights=w.tolist(),
-                validation_robustness_=float(0.0),
+                validation_robustness_=0.0,
                 evaluated_subset=True,
             )
-            return float(0.0)
+            return 0.0
 
-        # Restrict to the clean-correct subset
-        X_sub = X_arr[mask]
+        X_sub_adv = X_all[mask].copy()
         y_sub = y_true[mask]
-        print(f"[RobustnessEval] Attacking subset X_sub with shape={X_sub.shape}", flush=True)
+        orig_correct_idx = _np.where(mask)[0]
 
-        # ART black-box wrapper with logging; align PredictLogger budget with attacked samples
-        max_eval_budget = int(len(X_sub)) * 25
-        pred_with_logging = PredictLogger(ensemble_model.predict_proba, max_eval=max_eval_budget, name="HSJ")
-        classifier = BlackBoxClassifier(
-            pred_with_logging,
-            (X_arr.shape[1],),
-            len(self.classes_),
-            clip_values=(feat_min.astype(_np.float32), feat_max.astype(_np.float32)),
-        )
+        n_success = 0
+        n_failed = 0
+
+        for local_idx, orig_idx in enumerate(orig_correct_idx, start=1):
+            if local_idx % 50 == 0 or local_idx == len(orig_correct_idx):
+                print(
+                    f"[QDO-ES] PermuteAttack progress {local_idx}/{len(orig_correct_idx)} instances",
+                    flush=True,
+                )
+
+            x_i = X_all[orig_idx]
+
+            x_adv_i, fail_reason = run_permute_attack_single_instance(
+                estimator=ensemble_model,
+                x_i=x_i,
+                x_train=X_train_attack,
+                true_label=y_true[orig_idx],
+                feature_names=feature_names,
+                sol_per_pop=35,
+                num_parents_mating=15,
+                num_generations=100,
+                n_runs=1,
+                beta=0.96,
+                black_list=None,
+                verbose=False,
+                target=None,
+            )
+
+            if x_adv_i is None:
+                n_failed += 1
+                continue
+
+            X_sub_adv[local_idx - 1] = x_adv_i[0]
+            n_success += 1
+
         print(
-            f"[RobustnessEval] clip_values set to per-feature arrays with shapes: "
-            f"{classifier.clip_values[0].shape}, {classifier.clip_values[1].shape}",
+            f"[QDO-ES] PermuteAttack finished on clean-correct subset | "
+            f"success={n_success}, failed={n_failed}",
             flush=True,
         )
-        print("[RobustnessEval] built / wrapped classifier", flush=True)
-        print("[RobustnessEval] starting attack.generate | X_sub shape: "
-              f"{getattr(X_sub, 'shape', None)}", flush=True)
 
-        # Instantiate adversarial attack (same parameters as in MOO‑ES)
-        attack = HopSkipJump(
-            classifier=classifier,
-            targeted=False,  # untargeted, so no need to pass y
-            max_iter=3,
-            max_eval=25,
-            init_eval=20,
-            init_size=3,
-            verbose=True,  # enable built-in logging
-        )
-
-        # Generate adversarials only for clean-correct points and score conditionally
-        X_sub_adv = attack.generate(x=X_sub)
-        print("[RobustnessEval] attack.generate DONE", flush=True)
-        adv_preds_sub = classifier.predict(x=X_sub_adv)
-
-        # Use probabilities directly to score (and not class labels)
+        adv_preds_sub = ensemble_model.predict_proba(X_sub_adv)
         adv_accuracy = self.score_metric(y_sub, adv_preds_sub, to_loss=False, checks=False)
-        print(
-            f"[RobustnessEval] adv_accuracy on clean-correct subset = {adv_accuracy:.6f}",
-            flush=True,
-        )
+        success_rate = float(n_success / max(1, num_correct))
+
+        print(f"[QDO-ES] adv_accuracy on clean-correct subset = {adv_accuracy:.6f}", flush=True)
+
         self.validation_robustness_ = float(adv_accuracy)
 
-        # Update metadata (do not overwrite existing top-level keys)
-        robustness_meta = dict(
-            robustness_attack="HopSkipJump",
-            attack_params=dict(max_iter=3, max_eval=25, init_eval=20, init_size=3, targeted=False),
-            n_samples=int(len(X_arr)),
+        self.model_specific_metadata_["robustness"] = dict(
+            robustness_attack="PermuteAttack",
+            attack_params={
+                "sol_per_pop": 35,
+                "num_parents_mating": 15,
+                "num_generations": 100,
+                "n_runs": 1,
+                "beta": 0.96,
+                "black_list": None,
+                "verbose": False,
+                "target": None,
+            },
+            n_samples=int(len(X_all)),
             n_clean_correct=int(num_correct),
-            n_classes=int(len(self.classes_)),
-            clip_values="per-feature",
+            n_success=int(n_success),
+            n_failed=int(n_failed),
+            success_rate=success_rate,
             weights=w.tolist(),
             validation_robustness_=float(adv_accuracy),
             evaluated_subset=True,
         )
-        if not hasattr(self, 'model_specific_metadata_') or self.model_specific_metadata_ is None:
-            self.model_specific_metadata_ = {}
-        self.model_specific_metadata_["robustness"] = robustness_meta
 
         return float(adv_accuracy)
 
     def ensemble_passthrough_fit(self, X, base_model_predictions, labels):
-        """Passthrough fit for QDO: keep original optimization on cached predictions,
-        then load actual base models and run post-hoc robustness evaluation.
         """
-        if not hasattr(self, 'model_specific_metadata_') or self.model_specific_metadata_ is None:
+        Passthrough fit for QDO:
+        1. run original QDO optimization on cached predictions
+        2. evaluate final ensemble robustness with PermuteAttack on raw validation data
+           (evaluate_robustness() reconstructs the train split and loads the actual base models)
+        """
+        if not hasattr(self, "model_specific_metadata_") or self.model_specific_metadata_ is None:
             self.model_specific_metadata_ = {}
 
         _t0_total = time.perf_counter()
 
-        # Step 1: run original optimizer using cached predictions
+        # Step 1: run original QDO optimizer
         _t0_opt = time.perf_counter()
         self.ensemble_fit(base_model_predictions, labels)
         _t1_opt = time.perf_counter()
 
-        # Step 2: load real base models
+        # Step 2: robustness evaluation with PermuteAttack
+        # evaluate_robustness() will load the actual base models itself after it has extracted metadata
         _t0_load = time.perf_counter()
-        self._load_actual_base_models()
-        _t1_load = time.perf_counter()
+        _t1_load = _t0_load
 
-        # Step 3: evaluate robustness on raw features
         _t0_rob = time.perf_counter()
         self.evaluate_robustness(X, labels)
         _t1_rob = time.perf_counter()
 
         _t1_total = time.perf_counter()
 
-        # Store timings
         self.model_specific_metadata_.update(dict(
             wallclock_total_sec=float(_t1_total - _t0_total),
             wallclock_optimization_sec=float(_t1_opt - _t0_opt),

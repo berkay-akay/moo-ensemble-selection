@@ -3,29 +3,93 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 import numpy as np
 from pymoo.core.problem import Problem
 from assembled_ensembles.util.metrics import AbstractMetric
-from art.attacks.evasion import HopSkipJump
-from art.estimators.classification import BlackBoxClassifier
 from sklearn.utils import check_random_state
 from typing import List, Optional, Callable, Union
-import logging
 
-# Class for logging
-class PredictLogger:
-    def __init__(self, predict_fn, max_eval=None, name="HSJ"):
-        self.predict_fn = predict_fn
-        self.max_eval = max_eval
-        self.name = name
-        self.n_calls = 0
-    def __call__(self, X):
-        self.n_calls += getattr(X, "shape", (0,))[0] or 0
-        if self.n_calls % 100 == 0:
-            if self.max_eval:
-                pct = min(100.0, 100.0 * self.n_calls / self.max_eval)
-                print(f"[{self.name}] queries={self.n_calls}/{self.max_eval} ({pct:.1f}%)", flush=True)
-            else:
-                print(f"[{self.name}] queries={self.n_calls}", flush=True)
-        return self.predict_fn(X)
+from assembled_ensembles.methods.moo.permute_attack.ga_attack import GAdvExample
 
+def run_permute_attack_single_instance(
+    estimator,
+    x_i,
+    x_train,
+    true_label,
+    feature_names=None,
+    sol_per_pop=35,
+    num_parents_mating=15,
+    num_generations=100,
+    n_runs=1,
+    beta=0.96,
+    black_list=None,
+    verbose=False,
+    target=None,
+):
+    """
+    Runs PermuteAttack on a single instance.
+    Returns (x_adv_i, reason), where:
+      - x_adv_i is shape (1, d) if attack succeeded
+      - x_adv_i is None if no valid adversarial was found
+    """
+    x_i = np.asarray(x_i, dtype=np.float32).reshape(-1)
+    x_train = np.asarray(x_train, dtype=np.float32)
+
+    attack = GAdvExample(
+        cat_vars_ohe=None,  # you already abort on categorical-feature datasets
+        feature_names=None,
+        sol_per_pop=sol_per_pop,
+        num_parents_mating=num_parents_mating,
+        num_generations=num_generations,
+        n_runs=n_runs,
+        black_list=[] if black_list is None else list(black_list),
+        beta=beta,
+        verbose=verbose,
+        target=target,
+    )
+
+    try:
+        # DEBUG PRINTS
+        #print(
+        #    f"[PermuteAttackDebug] x_i dtype={x_i.dtype}, shape={x_i.shape} | "
+        #    f"x_train dtype={x_train.dtype}, shape={x_train.shape} | "
+        #    f"true_label={true_label} ({type(true_label)}) | "
+        #    f"feature_names_type={type(feature_names)} | "
+        #    f"feature_names_sample={None if feature_names is None else feature_names[:4]}",
+        #    flush=True,
+        #)
+
+        _, _, x_success = attack.attack(
+            estimator=estimator,
+            x=x_i,
+            x_train=x_train,
+        )
+    except Exception as e:
+        return None, (
+            f"exception:{e} | "
+            f"x_i_dtype={getattr(x_i, 'dtype', None)} | "
+            f"x_train_dtype={getattr(x_train, 'dtype', None)} | "
+            f"true_label_type={type(true_label)} | "
+            f"feature_names_type={type(feature_names)}"
+        )
+
+    if x_success is None or len(x_success) == 0:
+        return None, "no_success"
+
+    x_success = np.asarray(x_success, dtype=np.float32)
+    if x_success.ndim == 1:
+        x_success = x_success.reshape(1, -1)
+
+    # Pick the sparsest successful candidate, tie-break by smallest L1 distance
+    x_orig = x_i.reshape(1, -1)
+    l0 = np.count_nonzero(x_success != x_orig, axis=1)
+    l1 = np.sum(np.abs(x_success - x_orig), axis=1)
+    best_idx = np.lexsort((l1, l0))[0]
+    x_adv_i = x_success[best_idx:best_idx + 1]
+
+    # Re-check that it is actually adversarial
+    pred_adv = np.asarray(estimator.predict(x_adv_i)).reshape(-1)
+    if pred_adv.size == 0 or pred_adv[0] == true_label:
+        return None, "not_adversarial"
+
+    return x_adv_i, None
 
 class EnsembleSklearnWrapper(BaseEstimator, ClassifierMixin):
     """Sklearn-compatible wrapper around a weighted ensemble of sklearn base models.
@@ -138,7 +202,10 @@ class MOOEnsembleProblem(Problem):
                  classes_: Optional[np.ndarray] = None,
                  base_models_metadata: Optional[List[dict]] = None,
                  adv_union_predictions: np.ndarray = None,
-                 adv_union_labels: np.ndarray = None):
+                 adv_union_labels: np.ndarray = None,
+                 X_train_attack: Optional[np.ndarray] = None,
+                 permute_attack_kwargs: Optional[dict] = None):
+
         # Initialize the superclass (Pymoo problem)
         super().__init__(
             n_var=n_base_models,     # Number of decision variables (weights for base models)
@@ -148,7 +215,6 @@ class MOOEnsembleProblem(Problem):
             xu=1.0,                  # Upper bounds for variables (weights <= 1)
             type_var=np.double       # Data type of variables
         )
-
         self.predictions = predictions
         self.labels = labels
         self.score_metric = score_metric
@@ -160,9 +226,24 @@ class MOOEnsembleProblem(Problem):
         self.base_models_metadata = base_models_metadata
         self.adv_union_predictions = adv_union_predictions
         self.adv_union_labels = adv_union_labels
+        self.X_train_attack = None if X_train_attack is None else np.asarray(X_train_attack, dtype=np.float32)
         if self.adv_union_predictions is not None:
             print(f"[MOOProblem] Using surrogate robustness on union set with shape: "
                   f"{getattr(self.adv_union_predictions, 'shape', None)}", flush=True)
+
+        default_permute_attack_kwargs = dict(
+            sol_per_pop=35,
+            num_parents_mating=15,
+            num_generations=100,
+            n_runs=1,
+            beta=0.96,
+            black_list=None,
+            verbose=False,
+            target=None,
+        )
+        if permute_attack_kwargs is not None:
+            default_permute_attack_kwargs.update(permute_attack_kwargs)
+        self.permute_attack_kwargs = default_permute_attack_kwargs
 
 
     def _evaluate(self, x, out, *args, **kwargs):
@@ -183,7 +264,11 @@ class MOOEnsembleProblem(Problem):
         # Iterate over weight vectors in NSGA-II population
         for weights in x:
             # Normalize weights
-            weights = weights / np.sum(weights)
+            w_sum = np.sum(weights)
+            if w_sum <= 0:
+                weights = np.ones_like(weights) / len(weights)
+            else:
+                weights = weights / w_sum
 
             # Aggregate ensemble predictions using weights (predictions on the clean validation set)
             ensemble_pred = self._ensemble_predict(self.predictions, weights)
@@ -233,11 +318,13 @@ class MOOEnsembleProblem(Problem):
                         f"[Surrogate] Adv-accuracy over union (all points) = {robust_rate:.6f}",
                         flush=True,
                     )
+
                 else:
                     M = n_union // N  # number of attacker blocks
                     U_reshaped = U.reshape(M, N, -1)  # (M, N, C)
                     adv_pred_labels = np.argmax(U_reshaped, axis=2)  # (M, N), convert probabilities to class labels
 
+                    # Code for "new" surrogate that uses survival values and weighted averaging
                     # Survival indicator per attacker block and instance:
                     # kept_true[m, i] = 1 if attacked copy from block m keeps the true label for instance i
                     y_true_b = np.broadcast_to(y_true, (M, N)) # Copy true labels to all attacker blocks
@@ -261,8 +348,15 @@ class MOOEnsembleProblem(Problem):
                             weights=attacker_weights
                         )
 
-                        # Final surrogate robustness = average per-instance survival (over the ensemble-clean-correct instances only)
-                        robust_rate = float(np.mean(per_instance_survival[correct_mask]))
+                        # New pruning rule:
+                        # if survival drops below 0.5, set it to 0.0
+                        per_instance_survival_pruned = per_instance_survival.copy()
+                        per_instance_survival_pruned[per_instance_survival_pruned < 0.5] = 0.0
+
+                        # Final surrogate robustness = average pruned per-instance survival
+                        # over the ensemble-clean-correct instances only
+                        robust_rate = float(np.mean(per_instance_survival_pruned[correct_mask]))
+
 
             # Pymoo minimizes -> negate to maximize robustness
             f2.append(-robust_rate)
@@ -294,23 +388,14 @@ class MOOEnsembleProblem(Problem):
 
     def _evaluate_robustness(self, weights: np.ndarray) -> float:
         """
-        Evaluate robustness of ensemble using ART black-box attack
-        Returns adversarial accuracy.
+        Evaluate robustness of ensemble using PermuteAttack.
+        Returns adversarial accuracy on the clean-correct subset.
         """
 
-        # logging for ART
-        import logging
-        root = logging.getLogger()
-        if not root.handlers:
-            h = logging.StreamHandler()
-            h.setLevel(logging.INFO)
-            h.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s"))
-            root.addHandler(h)
-            root.setLevel(logging.INFO)
-        for name in ("art", "art.attacks", "art.attacks.evasion"):
-            logging.getLogger(name).setLevel(logging.INFO)
+        if self.X_train_attack is None:
+            raise ValueError("X_train_attack is required for PermuteAttack-based robustness evaluation.")
 
-        # Try to recover original feature names from metadata (from fake base models)
+        # Recover original feature names from metadata
         feature_names = None
         try:
             if self.base_models_metadata and len(self.base_models_metadata) > 0:
@@ -324,11 +409,13 @@ class MOOEnsembleProblem(Problem):
         except Exception:
             feature_names = None
 
-        # Build sklearn-compatible ensemble wrapper around unpickled base models
+        # Build sklearn-compatible ensemble wrapper
+        attack_classes = np.arange(len(self.classes_))
+
         ensemble_model = EnsembleSklearnWrapper(
             base_models=self.base_models,
             weights=weights,
-            classes_=self.classes_,
+            classes_=attack_classes,
             feature_names=feature_names,
         )
         assert isinstance(ensemble_model, BaseEstimator)
@@ -336,77 +423,85 @@ class MOOEnsembleProblem(Problem):
 
         ensemble_model.fit()
 
-        # Enable logging
-        logging.getLogger("art").setLevel(logging.INFO)
-        logging.getLogger("art.attacks").setLevel(logging.INFO)
-        logging.getLogger("art.attacks.evasion").setLevel(logging.INFO)
+        print("[RobustnessEval] entering _evaluate_robustness with PermuteAttack", flush=True)
 
-        print("[RobustnessEval] entering _evaluate_robustness", flush=True)
-
-        # Use per-feature bounds / clip-values
-        X_all = np.asarray(self.X)
-        X_all = X_all.astype(np.float32, copy=False)
-        feat_min = X_all.min(axis=0)
-        feat_max = X_all.max(axis=0)
-        same = feat_max <= feat_min
-        feat_max[same] = feat_min[same] + 1e-8
-
-        # Compute clean predictions to get the clean-correct mask
-        proba_clean = ensemble_model.predict_proba(X_all)  # (N, C)
+        X_all = np.asarray(self.X, dtype=np.float32)
         y_true = np.asarray(self.labels)
+
+        # Clean-correct mask
+        proba_clean = ensemble_model.predict_proba(X_all)
         y_pred_clean = np.argmax(proba_clean, axis=1)
         mask = (y_pred_clean == y_true)
         num_correct = int(mask.sum())
+
         print(
             f"[RobustnessEval] clean-correct mask computed: num_clean_correct={num_correct} / N={len(y_true)}",
             flush=True,
         )
+
         if num_correct == 0:
             print("[RobustnessEval] No clean-correct instances; returning 0.0", flush=True)
-            return float(0.0)
+            return {
+                "adv_accuracy": 0.0,
+                "n_clean_correct": 0,
+                "n_success": 0,
+                "n_failed": 0,
+                "success_rate": 0.0,
+            }
 
-        X_sub = X_all[mask]
+        X_sub_adv = X_all[mask].copy()
         y_sub = y_true[mask]
-        print(f"[RobustnessEval] Attacking subset X_sub with shape={X_sub.shape}", flush=True)
+        orig_correct_idx = np.where(mask)[0]
 
-        # Wrap with ART and run a black-box attack
-        max_eval_budget = int(len(X_sub)) * 25
-        pred_with_logging = PredictLogger(ensemble_model.predict_proba, max_eval=max_eval_budget, name="HSJ")
-        classifier = BlackBoxClassifier(
-            pred_with_logging,
-            (X_all.shape[1],),
-            len(self.classes_),
-            clip_values=(feat_min.astype(np.float32), feat_max.astype(np.float32)),
-        )
+        n_success = 0
+        n_failed = 0
+
+        for local_idx, orig_idx in enumerate(orig_correct_idx, start=1):
+            if local_idx % 50 == 0 or local_idx == len(orig_correct_idx):
+                print(
+                    f"[RobustnessEval] PermuteAttack progress "
+                    f"{local_idx}/{len(orig_correct_idx)} instances",
+                    flush=True,
+                )
+
+            x_i = X_all[orig_idx]
+
+            x_adv_i, fail_reason = run_permute_attack_single_instance(
+                estimator=ensemble_model,
+                x_i=x_i,
+                x_train=self.X_train_attack,
+                true_label=y_true[orig_idx],
+                feature_names=feature_names,
+                **self.permute_attack_kwargs,
+            )
+
+            if x_adv_i is None:
+                n_failed += 1
+                continue
+
+            X_sub_adv[local_idx - 1] = x_adv_i[0]
+            n_success += 1
+
         print(
-            f"[RobustnessEval] clip_values set to per-feature arrays with shapes: "
-            f"{classifier.clip_values[0].shape}, {classifier.clip_values[1].shape}",
+            f"[RobustnessEval] PermuteAttack finished on clean-correct subset | "
+            f"success={n_success}, failed={n_failed}",
             flush=True,
         )
-        print("[RobustnessEval] built / wrapped classifier", flush=True)
-        print("[RobustnessEval] starting attack.generate | X_sub shape: "
-              f"{getattr(X_sub, 'shape', None)}", flush=True)
 
-        # Instantiate adversarial attack
-        attack = HopSkipJump(
-            classifier=classifier,
-            targeted=False,  # untargeted
-            max_iter=3,
-            max_eval=25,
-            init_eval=20,
-            init_size=3,
-            verbose=True,  # enable built-in logging
-        )
+        adv_preds_sub = ensemble_model.predict_proba(X_sub_adv)
 
-        # Generate adversarials only for clean-correct points and score conditionally
-        X_sub_adv = attack.generate(x=X_sub)
-        print("[RobustnessEval] attack.generate DONE", flush=True)
-        adv_preds_sub = classifier.predict(x=X_sub_adv)
-
-        # Use probabilities directly to score (and not class labels)
         adv_accuracy = self.score_metric(y_sub, adv_preds_sub, to_loss=False, checks=False)
+        attack_success_rate = float(n_success / max(1, num_correct))
+
         print(
             f"[RobustnessEval] adv_accuracy on clean-correct subset = {adv_accuracy:.6f}",
             flush=True,
         )
-        return float(adv_accuracy)
+
+        return {
+            "adv_accuracy": float(adv_accuracy),
+            "n_clean_correct": int(num_correct),
+            "n_success": int(n_success),
+            "n_failed": int(n_failed),
+            "success_rate": attack_success_rate,
+        }
