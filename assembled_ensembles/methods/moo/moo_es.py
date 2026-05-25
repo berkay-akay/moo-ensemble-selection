@@ -1065,6 +1065,10 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
             best_rob_index=best_true_robust_index,
             best_rob_accuracy=best_true_robust_accuracy,
             best_rob_robustness_true=best_true_robust_robustness,
+            best_rob_weights=(
+                None if best_true_robust_index is None else
+                [float(w) for w in np.asarray(pareto_weights[best_true_robust_index], dtype=float).tolist()]
+            ),
             # End-of-run diagnostics
             final_pareto_front_size=final_pareto_front_size,
             final_hypervolume=final_hypervolume,
