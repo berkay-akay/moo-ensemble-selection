@@ -319,8 +319,8 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
     n_jobs: int, default=-1
         Cores to use for parallelization. If -1, use all available cores.
         Please be aware that multi-processing introduces a time overhead.
-    reattack_top5_only: bool, default=True
-        When set to True, only the top-5 ensembles (based on clean accuracy) in the pareto front will be re-attacked.
+    reattack_top3_only: bool, default=True
+        When set to True, only the top-3 ensembles (based on clean accuracy) in the pareto front will be re-attacked.
         When set to False, all pareto-optimal ensembles will be re-attacked.
     TODO: Add parameter for final ensemble selection (value between 0 and 1 to prioritize either accuracy or robustness).
     """
@@ -328,7 +328,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
     # Initialize parameters for MOO Ensemble Selection
     def __init__(self, base_models: List[Callable], n_generations: int, population_size: int,
                  score_metric: AbstractMetric, random_state: Optional[Union[int, np.random.RandomState]] = None,
-                 n_jobs: int = -1, passthrough: bool = True, reattack_top5_only: bool = True,
+                 n_jobs: int = -1, passthrough: bool = True, reattack_top3_only: bool = True,
                  permute_attack_kwargs: Optional[dict] = None) -> None:
         super().__init__(
             base_models,
@@ -340,7 +340,7 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         self.score_metric = score_metric
         self.random_state = check_random_state(random_state)
         self.n_jobs = n_jobs
-        self.reattack_top5_only = reattack_top5_only
+        self.reattack_top3_only = reattack_top3_only
 
         default_permute_attack_kwargs = dict(
             sol_per_pop=35,
@@ -927,8 +927,8 @@ class MOOEnsembleSelection(AbstractWeightedEnsemble):
         for i, (a, r) in enumerate(zip(pareto_acc, pareto_robust_surr)):
             print(f"[MOO-ES] Pareto-optimal ensemble (surrogate) idx={i} | accuracy={a:.6f} | adv_acc_surr={r:.6f}", flush=True)
 
-        if self.reattack_top5_only:
-            top_k = min(5, len(pareto_weights))
+        if self.reattack_top3_only:
+            top_k = min(3, len(pareto_weights))
             reattack_idx = np.argsort(-pareto_acc)[:top_k]
             print(
                 f"[MOO-ES] Re-attacking only top {top_k} Pareto-optimal ensembles by accuracy: "

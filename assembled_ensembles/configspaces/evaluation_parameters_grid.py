@@ -21,7 +21,7 @@ def get_qdo_config_space(seed_function_individual_fold):
     hp_archive_type = Categorical("archive_type", ["sliding", "quality"])
     cond_3 = EqualsCondition(hp_archive_type, hp_methods, "QDOEnsembleSelection")
 
-    # Hyperparameters for MOOEnsembleSelection (first idea, not final)
+    # Hyperparameters for MOOEnsembleSelection
     hp_n_generations = Categorical("n_generations", [1, 2, 10, 20, 25, 50, 100])
     cond_n_generations = EqualsCondition(hp_n_generations, hp_methods, "MOOEnsembleSelection")
 
