@@ -1,76 +1,65 @@
-# [Reproducibility Repository] Q(D)O-ES: Population-based Quality (Diversity) Optimisation for Post Hoc Ensemble Selection in AutoML
+# [Reproducibility Repository] MOEns: Post-Hoc Multi-Objective Ensembling for Predictive Accuracy and Adversarial Robustness in AutoML
 
-This repository is related to the paper "Q(D)O-ES: Population-based Quality (Diversity) Optimisation for Post Hoc
-Ensemble Selection in AutoML".
-It provides the code used to generate and save the base models' data and run the ensemble methods on the base models'
-data.
-This README provides a short overview of the code base before showing how to reproduce our results.
+This repository is related to the bachelor thesis **"Exploring Post-Hoc Multi-Objective Ensembling for Predictive Accuracy and Adversarial Robustness in AutoML"**.
+It provides the code used to generate Auto-Sklearn base model pools, run post-hoc ensembling methods, and evaluate ensembles with respect to clean predictive performance and adversarial robustness.
 
-We ran the scripts provided in this repository in a highly parallel manner across specific hardware.
-We do not provide the code for parallelization in this repository as it is hard-coded and designed for the used hardware
-and does not translate to other systems.
-Instead, we provide a minimal example and all information necessary to run the code and leave it to the user to
-parallelize the scripts if needed.
+The repository builds on the existing Q(D)O-ES codebase by Purucker et al. (2023). The original framework is used for running Auto-Sklearn, storing model-pool data, pruning base models, and executing post-hoc ensemble selection methods. This repository extends the framework with **MOEns**, a multi-objective post-hoc ensembling method that optimises continuous ensemble weights with NSGA-II.
 
-### Paper TL;DR
+We ran the experiments in a parallel HPC environment. The repository provides scripts and example commands, but users may need to adapt paths, environments, and parallelisation scripts to their own system.
 
-Two Novel Population-based Methods for Post Hoc Ensemble Selection in AutoML.
+### Thesis TL;DR
 
-### Paper Abstract
+MOEns is a post-hoc multi-objective ensembling method for AutoML that jointly considers clean predictive performance and adversarial robustness.
 
-Automated machine learning (AutoML) systems commonly ensemble models post hoc to improve predictive performance,
-typically via greedy ensemble selection (GES). However, we believe that GES may not always be optimal, as it performs a
-simple deterministic greedy search. In this work, we introduce two novel population-based ensemble selection methods,
-QO-ES and QDO-ES, and compare them to GES. While QO-ES optimises solely for predictive performance, QDO-ES also
-considers the diversity of ensembles within the population, maintaining a diverse set of well-performing ensembles
-during optimisation based on ideas of quality diversity optimisation. The methods are evaluated using 71 classification
-datasets from the AutoML benchmark, demonstrating that QO-ES and QDO-ES often outrank GES, albeit only statistically 
-significant on validation data. Our results further suggest that diversity can be beneficial for post hoc ensembling 
-but also increases the risk of overfitting.
+### Thesis Abstract
+
+Automated Machine Learning systems generate heterogeneous pools of candidate models that are commonly combined through post-hoc ensembling. Existing methods, including Greedy Ensemble Selection, CMA-ES-based weight optimisation, QO-ES and QDO-ES, mainly optimise predictive performance on clean validation data. However, high clean performance does not necessarily imply robustness against adversarial perturbations.
+
+This thesis investigates whether post-hoc ensembling can improve adversarial robustness in AutoML. It proposes a multi-objective ensembling method, **MOEns**, that optimises continuous ensemble weight vectors using NSGA-II with respect to clean predictive performance and a surrogate robustness objective. Selected Pareto-optimal ensembles are then re-evaluated using PermuteAttack to estimate their true adversarial robustness.
+
+Experiments on tabular classification datasets with Auto-Sklearn base model pools show that the robustness of individual base models varies substantially across datasets and classification algorithms. Compared to the single-objective baseline QO-ES, MOEns achieves slightly lower clean balanced accuracy, but improves balanced adversarial accuracy on most datasets and often shows more stable robustness across folds. The Pareto-front analysis further shows that MOEns can reveal meaningful trade-offs between clean performance and adversarial robustness, although the surrogate robustness objective remains imperfect.
 
 ## Results Teaser
-The goal of _post hoc ensembling_ for AutoML is to aggregate a pool of base models consisting of all models that are
-trained and validated during an AutoML system's model selection or a subset thereof.
 
-In our paper, we proposed `QO-ES` and `QDO-ES`, two new population-based ensemble selection methods to perform post hoc 
-ensembling in AutoML. We compared the new methods to `GES` and the single best model (no ensembling) `SingleBest`
+The goal of post-hoc ensembling in this repository is to construct ensembles from a pool of base models generated by Auto-Sklearn. MOEns extends this setting by optimising two objectives:
 
-Below are the Critical Differences (CD) plots w.r.t. **test scores** for binary and multi-class classification for the 
-71 datasets from the AutoML benchmark. The plots are additionally split for balanced accuracy and ROC AUC, because 
-these represent different optimization problems. Methods connected by a vertical bar are not significantly different. 
-The axis at the top and the line connected to a method's name indicate the mean rank of the method. The lower the rank,
-the better the method.
+1. clean predictive performance on validation data, and
+2. surrogate adversarial robustness based on adversarial examples generated with PermuteAttack.
 
-#### Results w.r.t. **test scores**:
-![test_scores](result_teaser_test_scores.PNG)
+After the NSGA-II optimisation, selected Pareto-optimal ensembles are re-attacked with PermuteAttack to obtain true attack-based robustness values.
 
-#### Results w.r.t. **validation scores**:
-![val_scores](result_teaser_validation_scores.PNG)
+In the thesis experiments, MOEns was compared against QO-ES as a single-objective population-based baseline. The main findings were:
 
-For more details and results, see our paper (links can be found at the bottom of the README).
+* MOEns achieved higher balanced adversarial accuracy than QO-ES on most evaluated datasets.
+* MOEns often showed more stable adversarial robustness across folds.
+* QO-ES generally retained slightly higher clean balanced accuracy.
+* The Pareto fronts revealed a visible trade-off between clean predictive performance and surrogate-predicted robustness.
+* The surrogate robustness objective provided a useful but imperfect signal and did not always match the true PermuteAttack-based robustness evaluation.
 
 ## Data
 
-Parts of our code generated data that we used in our paper.
-To access the data, please see: [DOI](https://doi.org/10.6084/m9.figshare.23613627).
+The repository contains a minimal example under `benchmark/input/minimal_example_ens`.
+For full experiments, base model pools must be generated with the scripts in `assembled_ask` or provided in the expected metatask format.
+
+The thesis experiments used OpenML classification datasets, Auto-Sklearn base model pools, SiloTopN pruning to 50 base models, and folds 0--2 for computational feasibility.
 
 ## Content Overview
 
-* `assembled_ask`: Contains the code to run Auto-Sklearn 1.0 on the dataset from the AutoML benchmark and save data for
-  base models.
-* `assembled_ensemlbes`: Contains all code related to running ensemble methods.
-* `benchmark`: Contains the setup data for the benchmark, results, and evaluation data.
+* `assembled_ask`: Code for running Auto-Sklearn, collecting the generated base models, and building metatasks.
+* `assembled_ensembles`: Code for running post-hoc ensembling methods, including GES, QO-ES, QDO-ES, and MOEns.
+* `assembled_ensembles/methods/moo`: Implementation of MOEns, the NSGA-II optimisation problem, and the PermuteAttack-based robustness evaluation.
+* `benchmark`: Setup files, minimal input data, stored results, and evaluation utilities.
+* `run_moo_es_parallel.sbatch`: Example SLURM script for running MOEns on an HPC cluster.
 
 ## Reproducibility Workflow - Minimal Example
 
-The following provides a minimal example for each part of the code that we created for this publication.
-Each part can be done independently and does not require a previous part to be run first.
+The workflow consists of three parts. They can be executed independently if the required input data already exists.
 
-### Reproducing: Generating Base Model with Auto-Sklearn
+### Reproducing: Generating Base Models with Auto-Sklearn
 
 Please refer to `./assembled_ask/README.md` for details.
 
-### Reproducing: Running Post Hoc Ensembling Methods
+### Reproducing: Running Post-Hoc Ensembling Methods
 
 Please refer to `./assembled_ensembles/README.md` for details.
 
@@ -78,28 +67,15 @@ Please refer to `./assembled_ensembles/README.md` for details.
 
 Please refer to `./benchmark/evaluation/README.md` for details.
 
+## Relevant Publications
 
-## Relevant Publication
+If you use this repository, please cite the thesis and the original Q(D)O-ES codebase on which the repository builds.
 
-If you use our code or the data produced by our code in scientific publications, we would appreciate citations.
-
-**Q(D)O-ES: Population-based Quality (Diversity) Optimisation for Post Hoc Ensemble Selection in AutoML**,
-_Lennart Purucker, Lennart Schneider, Marie Anastacio, Joeran Beel, Bernd Bischl, Holger Hoos_,
-_Second International Conference on Automated Machine Learning, 2023_. 
-
-Link to publication: [OpenReview](https://openreview.net/forum?id=zvV7hemQmtLl) and [arXiv](https://arxiv.org/abs/2307.08364)
-
-Link to teaser video: [YouTube](https://www.youtube.com/watch?v=wzvCSN-94Hs&list=PLp7L30nGpKM8_lzMdDbUnYXUlfBGH_EA2&index=10)
-
-Link to full video: [YouTube](https://www.youtube.com/watch?v=E8d-se0COIo&list=PLp7L30nGpKM-6Y7LQdtb6TWX3o1d9BDSs&index=13)
-
-```
-@inproceedings{
-  purucker2023qdoes,
-  title={Q(D)O-{ES}: Population-based Quality (Diversity) Optimisation for Post Hoc Ensemble Selection in Auto{ML}},
-  author={Lennart Purucker and Lennart Schneider and Marie Anastacio and Joeran Beel and Bernd Bischl and Holger Hoos},
-  booktitle={AutoML Conference 2023},
-  year={2023},
-  url={https://openreview.net/forum?id=zvV7hemQmtLl}
+```bibtex
+@thesis{akay2026moens,
+  title  = {Exploring Post-Hoc Multi-Objective Ensembling for Predictive Accuracy and Adversarial Robustness in AutoML},
+  author = {Akay, Berkay},
+  school = {RWTH Aachen University},
+  year   = {2026},
+  type   = {Bachelor's Thesis}
 }
-```
