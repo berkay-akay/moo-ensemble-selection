@@ -1,65 +1,167 @@
 # Assembled-Ensembles
 
-This directory contains the ensemble methods as well as code to enable their usage.
-To evaluate the ensemble method we use the `assemlbed` framework as part of
-the `run_evaluate_ensemble_on_metatask.py` script.
+This directory contains the ensemble methods and the code needed to run them on metatasks. It includes the original post-hoc ensembling methods from the Q(D)O-ES repository and the proposed multi-objective method **MOEns**.
 
-In detail, code for methods can be found in the `methods` directory.
-The invocation of these methods by their configurations can be found in the `default_configurations` directory.
-The supported configurations and the grid of hyperparameters can be found in the `configspaces` directory.
-The `util` directory contains several important utilities necessary to run some ensemble techniques.
-The `wrappper` directory contains the code that wraps around all ensemble methods to expose a standardized sklearn-like
-interface.
+The main entry point is:
+
+```text
+run_evaluate_ensemble_on_metatask.py
+```
+
+This script loads a metatask, instantiates the chosen ensemble method, fits the ensemble on validation data, evaluates it, and stores metadata and results.
+
+## Directory Overview
+
+* `methods/ensemble_selection`: Greedy Ensemble Selection.
+* `methods/qdo`: QO-ES and QDO-ES.
+* `methods/moo`: MOEns, the NSGA-II problem definition, ensemble wrapper, and PermuteAttack implementation.
+* `default_configurations`: Factory functions for constructing ensemble methods from configuration strings.
+* `configspaces`: Supported configurations and parameter grids.
+* `util`: Metric handling, preprocessing helpers, and diversity utilities.
+* `wrapper`: Standardised wrappers around ensemble methods.
 
 ## Installation
 
-To run this part of our code, you will require a specific environment.
-We suggest to use [Docker](https://www.docker.com/) or [Singularity](https://sylabs.io/docs/).
-Once you have set up one of the above, use the dockerfile or singularity def file in the `environment` directory to
-build the python environment required to run the following scripts.
+To run this part of the code, use the environment files provided in the `environment` directory. A Linux environment is recommended.
+
+The MOEns implementation uses, among others:
+
+* `pymoo` for NSGA-II,
+* `scikit-learn` for model interfaces and metrics,
+* `NumPy` and `pandas` for data handling,
+* the included PermuteAttack implementation for attack-based robustness evaluation.
+
+## MOEns Overview
+
+MOEns is a post-hoc multi-objective ensembling method. It optimises continuous ensemble weight vectors over a pruned Auto-Sklearn base model pool.
+
+The method uses NSGA-II with two objectives:
+
+1. clean predictive performance on validation data, and
+2. surrogate adversarial robustness.
+
+The surrogate robustness objective is computed using an adversarial union pool. This pool is created by attacking each base model on its clean-correct validation instances with PermuteAttack. During NSGA-II, base-model predictions on this union pool are cached and reused to estimate the robustness of candidate ensembles efficiently.
+
+After optimisation, MOEns extracts the Pareto-optimal weight vectors. By default, it re-attacks the top Pareto-optimal ensembles by clean predictive performance and computes their true attack-based robustness using PermuteAttack.
+
+The final stored ensemble weights correspond to the Pareto-optimal ensemble with the highest clean predictive performance. The metadata also stores information about the ensemble with the highest true adversarial robustness among the re-attacked Pareto-optimal ensembles.
+
+## Main MOEns Parameters
+
+The main user-facing MOEns parameters in the configuration grid are:
+
+* `n_generations`: number of NSGA-II generations.
+* `population_size`: number of candidate weight vectors per NSGA-II generation.
+
+The implementation also exposes the following internal parameters:
+
+* `score_metric`: metric used for clean predictive performance and final true robustness evaluation.
+* `n_jobs`: number of CPU cores used by the method.
+* `reattack_top5_only`: if enabled, only the top Pareto-optimal ensembles by clean predictive performance are re-attacked.
+* `permute_attack_kwargs`: optional dictionary for changing the PermuteAttack configuration.
+
+The default PermuteAttack configuration is:
+
+```python
+sol_per_pop = 35
+num_parents_mating = 15
+num_generations = 100
+n_runs = 1
+beta = 0.96
+black_list = None
+verbose = False
+target = None
+```
+
+For the thesis experiments, MOEns was run with:
+
+```text
+n_generations = 50
+population_size = 50
+```
+
+This results in 2500 evaluated candidate weight vectors, matching the QO-ES optimisation budget used in the comparison.
 
 ## Minimal Example
 
-The following runs a hyperparameter configuration for each method: Greedy Ensemble Selection, the single best,
-QDO-ES, and QO-ES.
-Thereby, we run it on base model data generated for a toy dataset from sklearn (TaskID "-1") that is stored in
-this repository.
+The repository contains a toy metatask under `benchmark/input/minimal_example_ens`. The following commands run several ensemble methods on this minimal example.
+
+### SingleBest
 
 ```shell
-python run_evaluate_ensemble_on_metatask.py -1 SiloTopN "SingleBest" balanced_accuracy minimal_example_ens ensemble_evaluations_qdo no no -1 QDO conf_0
-python run_evaluate_ensemble_on_metatask.py -1 SiloTopN "EnsembleSelection|use_best" balanced_accuracy minimal_example_ens ensemble_evaluations_qdo no no -1 QDO conf_1
-python run_evaluate_ensemble_on_metatask.py -1 SiloTopN "QDOEnsembleSelection|archive_type:sliding|batch_size:20|behavior_space:bs_configspace_similarity_and_loss_correlation|buffer_ratio:1.0|crossover:two_point_crossover|crossover_probability:0.5|crossover_probability_dynamic|elite_selection_method:deterministic|emitter_initialization_method:AllL1|max_elites:16|mutation_probability_after_crossover:0.5|mutation_probability_after_crossover_dynamic|starting_step_size:1" balanced_accuracy minimal_example_ens ensemble_evaluations_qdo no no -1 QDO conf_2
-python run_evaluate_ensemble_on_metatask.py -1 SiloTopN "QDOEnsembleSelection|archive_type:quality|batch_size:20|crossover:two_point_crossover|crossover_probability:0.5|crossover_probability_dynamic|elite_selection_method:deterministic|emitter_initialization_method:AllL1|max_elites:16|mutation_probability_after_crossover:0.5|mutation_probability_after_crossover_dynamic|starting_step_size:1" balanced_accuracy minimal_example_ens ensemble_evaluations_qdo no no -1 QDO conf_3
+python run_evaluate_ensemble_on_metatask.py -1 SiloTopN "SingleBest" balanced_accuracy minimal_example_ens ensemble_evaluations_qdo no no -1 QDO conf_singlebest
 ```
 
-The results of the runs are stored under `benchmark/output/minimal_example_ens` with the name "conf_0", "conf_1", etc..
-One needs to parse and evaluate them to compute the results which we build our evaluation on.
-Otherwise, one can use the output of the script to obtain scores immediately.
+### Greedy Ensemble Selection
+
+```shell
+python run_evaluate_ensemble_on_metatask.py -1 SiloTopN "EnsembleSelection|use_best" balanced_accuracy minimal_example_ens ensemble_evaluations_qdo no no -1 QDO conf_ges
+```
+
+### QO-ES
+
+```shell
+python run_evaluate_ensemble_on_metatask.py -1 SiloTopN "QDOEnsembleSelection|archive_type:quality|batch_size:20|crossover:two_point_crossover|crossover_probability:0.5|crossover_probability_dynamic|elite_selection_method:deterministic|emitter_initialization_method:AllL1|max_elites:16|mutation_probability_after_crossover:0.5|mutation_probability_after_crossover_dynamic|starting_step_size:1" balanced_accuracy minimal_example_ens ensemble_evaluations_qdo no no -1 QDO conf_qo_es
+```
+
+### QDO-ES
+
+```shell
+python run_evaluate_ensemble_on_metatask.py -1 SiloTopN "QDOEnsembleSelection|archive_type:sliding|batch_size:20|behavior_space:bs_configspace_similarity_and_loss_correlation|buffer_ratio:1.0|crossover:two_point_crossover|crossover_probability:0.5|crossover_probability_dynamic|elite_selection_method:deterministic|emitter_initialization_method:AllL1|max_elites:16|mutation_probability_after_crossover:0.5|mutation_probability_after_crossover_dynamic|starting_step_size:1" balanced_accuracy minimal_example_ens ensemble_evaluations_qdo no no -1 QDO conf_qdo_es
+```
+
+### MOEns
+
+```shell
+python run_evaluate_ensemble_on_metatask.py -1 SiloTopN "MOOEnsembleSelection|n_generations:10|population_size:50" balanced_accuracy minimal_example_ens ensemble_evaluations_qdo no no -1 QDO conf_moens
+```
+
+The results are stored under:
+
+```text
+benchmark/output/<benchmark_name>/task_<task_id>/<evaluation_name>/<pruner>
+```
 
 ## Detail Usage Documentation
 
-To evaluate an ensemble on a metatask, execute the following script with the appropriate parameters.
-See `benchmark/setup_data/evaluation_data.json` for details on used parameters.
+To evaluate an ensemble on a metatask, execute:
 
-1) `python run_evaluate_ensemble_on_metatask.py task_id pruner ensemble_method_name metric_name benchmark_name evaluation_name isolate_execution load_method folds_to_run_on config_space_name ens_save_name`
-    * `task_id`: an OpenML task ID (for testing, pass `-1`)
-    * `pruner`: Either "TopN" or "SiloTopN" right now. Define which metatask to load.
-    * `ensemble_method_name`: Name of the ensemble method's configuration
-        * see `configspaces/name_grid_mapping_QDO.json`
-    * `metric_name`: metric name of the metric to be optimized by the ensemble method, we expect the import name of the
-      metric
-        * "roc_auc" or "balanced_accuracy"
-    * `benchmark_name`: The name of the benchmark, used to find the correct base path.
-        * The path to the output of the scripts from `assembled_ask`
-    * `evaluation_name`: The name of the evaluation setup, used to find the correct base path.
-        * e.g., "ensemble_evaluations_qdo"
-    * `isolate_execution`: If `yes`, we isolate the execution of the ensemble to avoid memory leakage (only works on
-      linux)
-    * `load_method`: If "delayed", we will only load data once needed for the specific fold. Otherwise, we will load the
-      whole metatask into memory at the start. Supported for CSV and HDF files.
-    * `folds_to_run_on`: If "-1" all folds are run sequentially. Else the number corresponds to the fold on which the
-      ensemble is evaluated.
-        * See `special_cases/parallel` in `benchmark/setup_data/evaluation_data.json` for the list of task ID where we
-          executed each fold individually instead of sequentially. This is important as it changes the random seed!
-    * `config_space_name`: "QDO"
-    * `ens_save_name` The name used to identify this configuration in the output for parsing.
+```shell
+python run_evaluate_ensemble_on_metatask.py task_id pruner ensemble_method_name metric_name benchmark_name evaluation_name isolate_execution load_method folds_to_run_on config_space_name ens_save_name
+```
+
+Arguments:
+
+* `task_id`: OpenML task ID. For testing, use `-1`.
+* `pruner`: pruning strategy used to load the metatask, usually `SiloTopN`.
+* `ensemble_method_name`: full method configuration string.
+* `metric_name`: metric optimised by the ensemble method, for example `balanced_accuracy`.
+* `benchmark_name`: name of the benchmark input folder.
+* `evaluation_name`: name of the evaluation output folder.
+* `isolate_execution`: use `yes` to isolate execution and reduce memory leakage; otherwise use `no`.
+* `load_method`: use `delayed` for delayed loading or `no` for loading the metatask at once.
+* `folds_to_run_on`: use `-1` for all folds or a single fold index such as `0`.
+* `config_space_name`: currently `QDO`, also used for MOEns configurations.
+* `ens_save_name`: name used to identify the configuration in the output files.
+
+## Stored Metadata for MOEns
+
+MOEns stores detailed metadata for later analysis. Important fields include:
+
+* clean predictive performance values for the Pareto front,
+* surrogate robustness values for the Pareto front,
+* true robustness values for re-attacked Pareto-optimal ensembles,
+* weights of the selected ensemble,
+* index and scores of the highest-clean-performance ensemble,
+* index and scores of the highest-true-robustness ensemble,
+* attack statistics for individual base models,
+* attack statistics for re-attacked Pareto-optimal ensembles,
+* per-generation NSGA-II diagnostics,
+* wall-clock times for adversarial-pool construction, optimisation, re-attack, and total runtime.
+
+## Notes and Limitations
+
+* MOEns currently expects numeric input features. Datasets with categorical input features are aborted.
+* MOEns is computationally expensive because it applies PermuteAttack repeatedly.
+* The surrogate robustness objective is an approximation and may overestimate or underestimate true attack-based robustness.
+* The final true robustness evaluation uses the same evaluation metric as clean predictive performance. In the thesis experiments, this was balanced accuracy.
