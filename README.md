@@ -79,3 +79,12 @@ If you use this repository, please cite the thesis and the original Q(D)O-ES cod
   year   = {2026},
   type   = {Bachelor's Thesis}
 }
+
+@inproceedings{
+  purucker2023qdoes,
+  title={Q(D)O-{ES}: Population-based Quality (Diversity) Optimisation for Post Hoc Ensemble Selection in Auto{ML}},
+  author={Lennart Purucker and Lennart Schneider and Marie Anastacio and Joeran Beel and Bernd Bischl and Holger Hoos},
+  booktitle={AutoML Conference 2023},
+  year={2023},
+  url={https://openreview.net/forum?id=zvV7hemQmtLl}
+}
